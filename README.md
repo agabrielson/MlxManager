@@ -441,19 +441,9 @@ Then retry launching the manager.
 
 ---
 
-## Minimal Bundle
-
-A minimal handoff bundle is also produced for quick distribution:
-
-- `mlx_manager_minimal_bundle.zip`
-
-That bundle is intended for quick sharing, while this repo remains the working source.
-
----
-
 ## Next Improvements
 
-Likely next high-value changes:
+Likely next changes:
 
 - stronger startup/warm-state telemetry
 - clearer on-battery defaults
