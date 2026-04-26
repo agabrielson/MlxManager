@@ -19,7 +19,7 @@ import urllib.error
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -87,6 +87,7 @@ LOCALHOST_HOST = "127.0.0.1"
 INTERNAL_HOST = "127.0.0.1"
 INTERNAL_PORT_OFFSET = 1
 DEFAULT_IDLE_MINUTES = 15
+DEFAULT_IDLE_ENABLED = True
 DEFAULT_SLEEP_MODE = "light"
 GATEWAY_POLL_INTERVAL_S = 120.0
 GATEWAY_STATS_WINDOW_S = 300.0
@@ -182,6 +183,10 @@ def load_settings() -> dict:
             settings["auth_enabled"] = False
         if "auth_token" not in settings:
             settings["auth_token"] = DEFAULT_GATEWAY_TOKEN
+        if "idle_enabled" not in settings:
+            settings["idle_enabled"] = DEFAULT_IDLE_ENABLED
+        if "idle_minutes" not in settings:
+            settings["idle_minutes"] = DEFAULT_IDLE_MINUTES
         if "sleep_mode" not in settings:
             settings["sleep_mode"] = DEFAULT_SLEEP_MODE
         return settings
@@ -337,6 +342,7 @@ class _Bridge(QObject):
     setup_refresh = pyqtSignal()
     activity_pulse = pyqtSignal()
     idle_timer_stop = pyqtSignal()
+    usage_refresh = pyqtSignal()
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -357,6 +363,7 @@ class MLXManagerWindow(QWidget):
         self._bridge.setup_refresh.connect(self._refresh_setup_status)
         self._bridge.activity_pulse.connect(self._apply_activity_pulse)
         self._bridge.idle_timer_stop.connect(self._stop_idle_timer)
+        self._bridge.usage_refresh.connect(self._refresh_usage_status)
 
         self._settings     = load_settings()
         self.mlx_binary    = find_mlx_binary()
@@ -372,7 +379,21 @@ class MLXManagerWindow(QWidget):
         self._sleeping     = False
         self._generation_ready = False
         self._deep_sleeping = False
+        self._status_changed_at = ""
         self._last_activity = time.time()
+        self._last_real_question_at = 0.0
+        self._last_real_question = ""
+        self._token_stats = {
+            "real_questions": 0,
+            "chat_requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_tokens": 0,
+            "exact_tokens": 0,
+            "last_total_tokens": 0,
+            "last_token_source": "none",
+        }
         self._last_synced_model = None
         self._last_synced_state = None
         self._startup_event = threading.Event()
@@ -386,6 +407,7 @@ class MLXManagerWindow(QWidget):
         self._gateway_request_times = deque()
         self._gateway_lock = threading.RLock()
         self._server_lock  = threading.RLock()
+        self._stats_lock = threading.RLock()
         self._radio_group  = QButtonGroup(self)
         self._radio_map    = {}   # model_id → QRadioButton
         self._dot_map      = {}   # model_id → QLabel
@@ -431,13 +453,28 @@ class MLXManagerWindow(QWidget):
         title.setFont(QFont("Helvetica", 16, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {TEXT}; background: transparent;")
 
-        self._status_lbl = QLabel("● checking…")
-        self._status_lbl.setFont(QFont("Menlo", 11))
-        self._status_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        status_wrap = QWidget()
+        status_wrap.setStyleSheet("background: transparent;")
+        status_layout = QVBoxLayout(status_wrap)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(2)
+
+        self._status_lbl = QLabel("◌ Checking")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._status_lbl.setFont(QFont("Helvetica", 10, QFont.Weight.Bold))
+        self._status_lbl.setMinimumWidth(220)
+
+        self._status_meta_lbl = QLabel("")
+        self._status_meta_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._status_meta_lbl.setFont(QFont("Menlo", 9))
+        self._status_meta_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+
+        status_layout.addWidget(self._status_lbl, alignment=Qt.AlignmentFlag.AlignRight)
+        status_layout.addWidget(self._status_meta_lbl, alignment=Qt.AlignmentFlag.AlignRight)
 
         hdr_layout.addWidget(title)
         hdr_layout.addStretch()
-        hdr_layout.addWidget(self._status_lbl)
+        hdr_layout.addWidget(status_wrap)
         root_layout.addWidget(hdr)
         root_layout.addWidget(self._divider())
 
@@ -525,8 +562,9 @@ class MLXManagerWindow(QWidget):
         ctrl_layout.addWidget(self._auth_token_entry)
 
         self._idle_toggle = QCheckBox("Sleep when idle")
-        self._idle_toggle.setChecked(bool(self._settings.get("idle_enabled", False)))
+        self._idle_toggle.setChecked(bool(self._settings.get("idle_enabled", DEFAULT_IDLE_ENABLED)))
         self._idle_toggle.setStyleSheet(f"color: {TEXT};")
+        self._idle_toggle.stateChanged.connect(lambda _state: self._on_idle_config_changed())
         ctrl_layout.addWidget(self._idle_toggle)
 
         idle_row = QHBoxLayout()
@@ -540,6 +578,7 @@ class MLXManagerWindow(QWidget):
             f"background: {SURF2}; color: {TEXT}; border: none;"
             f" border-radius: 4px; padding: 4px 8px;"
         )
+        self._idle_minutes_entry.editingFinished.connect(self._on_idle_config_changed)
         idle_row.addWidget(self._idle_minutes_entry)
         ctrl_layout.addLayout(idle_row)
 
@@ -560,8 +599,45 @@ class MLXManagerWindow(QWidget):
         sleep_mode = self._settings.get("sleep_mode", DEFAULT_SLEEP_MODE)
         idx = self._sleep_mode_combo.findData(sleep_mode)
         self._sleep_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._sleep_mode_combo.currentIndexChanged.connect(lambda _idx: self._on_idle_config_changed())
         sleep_mode_row.addWidget(self._sleep_mode_combo)
         ctrl_layout.addLayout(sleep_mode_row)
+
+        ctrl_layout.addWidget(self._divider())
+
+        usage_lbl = QLabel("IDLE / TOKEN USE")
+        usage_lbl.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
+        usage_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        ctrl_layout.addWidget(usage_lbl)
+
+        self._usage_status_frame = QFrame()
+        self._usage_status_frame.setStyleSheet(
+            f"background: {SURF2}; border: 1px solid {BORDER};"
+            " border-radius: 6px; padding: 6px;"
+        )
+        usage_layout = QVBoxLayout(self._usage_status_frame)
+        usage_layout.setContentsMargins(8, 6, 8, 6)
+        usage_layout.setSpacing(4)
+
+        self._idle_state_lbl = QLabel("")
+        self._idle_state_lbl.setFont(QFont("Helvetica", 10, QFont.Weight.Bold))
+        self._idle_state_lbl.setWordWrap(True)
+        self._idle_state_lbl.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        usage_layout.addWidget(self._idle_state_lbl)
+
+        self._usage_tokens_lbl = QLabel("")
+        self._usage_tokens_lbl.setFont(QFont("Menlo", 9))
+        self._usage_tokens_lbl.setWordWrap(True)
+        self._usage_tokens_lbl.setStyleSheet(f"color: {ACC2}; background: transparent;")
+        usage_layout.addWidget(self._usage_tokens_lbl)
+
+        self._last_question_lbl = QLabel("")
+        self._last_question_lbl.setFont(QFont("Menlo", 9))
+        self._last_question_lbl.setWordWrap(True)
+        self._last_question_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        usage_layout.addWidget(self._last_question_lbl)
+
+        ctrl_layout.addWidget(self._usage_status_frame)
 
         ctrl_layout.addWidget(self._divider())
 
@@ -663,6 +739,7 @@ class MLXManagerWindow(QWidget):
         root_layout.addWidget(log_container)
         self._set_cached_models(self.models)
         self._refresh_setup_status()
+        self._refresh_usage_status()
 
     def _make_btn(self, text, cmd, bg=SURF2, fg=TEXT):
         btn = QPushButton(text)
@@ -832,13 +909,20 @@ class MLXManagerWindow(QWidget):
         self._idle_timer.setSingleShot(True)
         self._idle_timer.timeout.connect(self._on_idle_timeout)
 
+    def _on_idle_config_changed(self):
+        self._persist_settings()
+        self._arm_idle_timer()
+        self._refresh_usage_status()
+
     def _apply_activity_pulse(self):
         self._last_activity = time.time()
         self._arm_idle_timer()
+        self._refresh_usage_status()
 
     def _stop_idle_timer(self):
         if hasattr(self, "_idle_timer"):
             self._idle_timer.stop()
+        self._refresh_usage_status()
 
     def _mark_expected_process_exit(self, proc, reason: str):
         if proc is None:
@@ -884,10 +968,10 @@ class MLXManagerWindow(QWidget):
         if not current or not self._idle_enabled():
             return
         if self._sleep_mode() == "deep":
-            self._append_log(f"⏸ Idle timeout reached ({self._idle_minutes()} min); entering deep sleep to save battery.")
+            self._append_log(f"⏸ No real question for {self._idle_minutes():g} min; entering deep sleep to save battery.")
             self._enter_deep_sleep(reason="idle timeout")
             return
-        self._append_log(f"⏸ Idle timeout reached ({self._idle_minutes()} min); pausing model to save battery.")
+        self._append_log(f"⏸ No real question for {self._idle_minutes():g} min; pausing model to save battery.")
         self._stop_model_server(reason="idle timeout", sleeping=True)
 
     def _refresh_dots(self, running_id: Optional[str]):
@@ -1054,6 +1138,190 @@ class MLXManagerWindow(QWidget):
     def _sleep_mode(self) -> str:
         return (self._sleep_mode_combo.currentData() or DEFAULT_SLEEP_MODE) if hasattr(self, "_sleep_mode_combo") else DEFAULT_SLEEP_MODE
 
+    def _format_clock(self, ts: float) -> str:
+        if not ts:
+            return "never"
+        return time.strftime("%I:%M %p", time.localtime(ts)).lstrip("0")
+
+    def _server_process_active(self) -> bool:
+        return bool(self.server_proc and self.server_proc.poll() is None)
+
+    def _decode_json_body(self, body: bytes) -> dict:
+        try:
+            return json.loads((body or b"{}").decode("utf-8", errors="replace")) or {}
+        except Exception:
+            return {}
+
+    def _content_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("input_text") or item.get("content") or ""
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(p for p in parts if p)
+        if isinstance(content, dict):
+            text = content.get("text") or content.get("input_text") or content.get("content") or ""
+            return text if isinstance(text, str) else ""
+        return ""
+
+    def _payload_user_texts(self, payload: dict) -> List[str]:
+        texts = []
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            if (message.get("role") or "").lower() != "user":
+                continue
+            text = self._content_text(message.get("content")).strip()
+            if text:
+                texts.append(text)
+        return texts
+
+    def _is_probe_payload(self, payload: dict, user_texts: List[str]) -> bool:
+        if len(user_texts) != 1:
+            return False
+        text = " ".join(user_texts[0].lower().split())
+        max_tokens = payload.get("max_tokens")
+        try:
+            max_tokens = int(max_tokens) if max_tokens is not None else None
+        except Exception:
+            max_tokens = None
+        return text in {"ping", "health", "health check", "readiness check"} and (max_tokens is None or max_tokens <= 8)
+
+    def _is_real_chat_question(self, payload: dict) -> bool:
+        user_texts = self._payload_user_texts(payload)
+        if not user_texts:
+            return False
+        return not self._is_probe_payload(payload, user_texts)
+
+    def _question_summary(self, payload: dict) -> str:
+        text = " ".join(self._payload_user_texts(payload)).strip()
+        if not text:
+            return ""
+        text = " ".join(text.split())
+        return text if len(text) <= 84 else f"{text[:81]}..."
+
+    def _record_real_question(self, payload: dict):
+        summary = self._question_summary(payload)
+        now = time.time()
+        with self._stats_lock:
+            self._last_real_question_at = now
+            self._last_real_question = summary
+            self._token_stats["real_questions"] += 1
+        self._bridge.usage_refresh.emit()
+
+    def _estimate_tokens_from_text(self, text: str) -> int:
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return 0
+        return max(1, int((len(cleaned) + 3) / 4))
+
+    def _estimate_prompt_tokens(self, payload: dict) -> int:
+        texts = []
+        for message in payload.get("messages") or []:
+            if isinstance(message, dict):
+                texts.append(self._content_text(message.get("content")))
+        return self._estimate_tokens_from_text("\n".join(texts))
+
+    def _extract_completion_text(self, response_payload: dict) -> str:
+        parts = []
+        for choice in response_payload.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message") or {}
+            if isinstance(message, dict):
+                parts.append(self._content_text(message.get("content")))
+            delta = choice.get("delta") or {}
+            if isinstance(delta, dict):
+                parts.append(self._content_text(delta.get("content")))
+        return "\n".join(p for p in parts if p)
+
+    def _record_token_usage(self, request_payload: dict, response_body: bytes, content_type: str = ""):
+        response_payload = {}
+        if (content_type or "").startswith("application/json"):
+            response_payload = self._decode_json_body(response_body)
+
+        usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
+        prompt_tokens = completion_tokens = total_tokens = 0
+        source = "estimated"
+
+        if isinstance(usage, dict):
+            try:
+                prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                completion_tokens = int(usage.get("completion_tokens") or 0)
+                total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+                source = "usage"
+            except Exception:
+                prompt_tokens = completion_tokens = total_tokens = 0
+
+        if total_tokens <= 0:
+            prompt_tokens = self._estimate_prompt_tokens(request_payload)
+            completion_tokens = self._estimate_tokens_from_text(self._extract_completion_text(response_payload))
+            if completion_tokens <= 0:
+                completion_tokens = self._estimate_tokens_from_text((response_body or b"").decode("utf-8", errors="replace"))
+            total_tokens = prompt_tokens + completion_tokens
+
+        with self._stats_lock:
+            self._token_stats["chat_requests"] += 1
+            self._token_stats["prompt_tokens"] += prompt_tokens
+            self._token_stats["completion_tokens"] += completion_tokens
+            self._token_stats["total_tokens"] += total_tokens
+            self._token_stats["last_total_tokens"] = total_tokens
+            self._token_stats["last_token_source"] = source
+            if source == "usage":
+                self._token_stats["exact_tokens"] += total_tokens
+            else:
+                self._token_stats["estimated_tokens"] += total_tokens
+        self._bridge.usage_refresh.emit()
+
+    def _token_stats_snapshot(self) -> dict:
+        with self._stats_lock:
+            stats = dict(self._token_stats)
+            stats["last_real_question_at"] = self._last_real_question_at
+            stats["last_real_question"] = self._last_real_question
+            return stats
+
+    def _refresh_usage_status(self):
+        if not hasattr(self, "_idle_state_lbl"):
+            return
+        stats = self._token_stats_snapshot()
+        idle_minutes = self._idle_minutes()
+        if self._sleeping or self._deep_sleeping:
+            if self._deep_sleeping:
+                idle_text = f"Deep sleep active. Use Load & Start to wake. Idle policy: {idle_minutes:g} min."
+            else:
+                idle_text = f"Sleeping now. The next real question wakes the last model. Idle policy: {idle_minutes:g} min."
+            idle_color = WARN
+        elif self._idle_enabled():
+            idle_text = f"Idle sleep ON: pauses after {idle_minutes:g} min without a real user question."
+            idle_color = OK
+        else:
+            idle_text = "Idle sleep OFF: model will stay loaded until stopped."
+            idle_color = WARN
+
+        self._idle_state_lbl.setText(idle_text)
+        self._idle_state_lbl.setStyleSheet(f"color: {idle_color}; background: transparent;")
+
+        total = stats.get("total_tokens", 0)
+        prompt = stats.get("prompt_tokens", 0)
+        completion = stats.get("completion_tokens", 0)
+        questions = stats.get("real_questions", 0)
+        source = stats.get("last_token_source", "none")
+        last_total = stats.get("last_total_tokens", 0)
+        self._usage_tokens_lbl.setText(
+            f"Tokens: {total:,} total ({prompt:,} prompt / {completion:,} completion) • "
+            f"{questions:,} real questions • last {last_total:,} [{source}]"
+        )
+
+        last_at = stats.get("last_real_question_at", 0.0)
+        last_q = stats.get("last_real_question") or "none"
+        self._last_question_lbl.setText(f"Last real question: {self._format_clock(last_at)} • {last_q}")
+
     def _mark_activity(self):
         self._bridge.activity_pulse.emit()
 
@@ -1073,7 +1341,8 @@ class MLXManagerWindow(QWidget):
             return "0 requests in last 5m"
         model_hits = sum(1 for _, kind in self._gateway_request_times if kind == 'models')
         chat_hits = sum(1 for _, kind in self._gateway_request_times if kind == 'chat')
-        return f"{len(self._gateway_request_times)} requests in last 5m ({model_hits} models, {chat_hits} chat)"
+        question_hits = sum(1 for _, kind in self._gateway_request_times if kind == 'question')
+        return f"{len(self._gateway_request_times)} requests in last 5m ({model_hits} models, {chat_hits} chat, {question_hits} real questions)"
 
     def _sync_llm_os_if_needed(self, model_id: Optional[str], state: str, log_fn=None):
         if not model_id:
@@ -1117,7 +1386,27 @@ class MLXManagerWindow(QWidget):
             state = "warming"
         else:
             state = "stopped"
-        return {"object": "list", "data": data, "state": state}
+        stats = self._token_stats_snapshot()
+        return {
+            "object": "list",
+            "data": data,
+            "state": state,
+            "idle": {
+                "enabled": self._idle_enabled(),
+                "minutes": self._idle_minutes(),
+                "sleep_mode": self._sleep_mode(),
+                "last_real_question_at": stats.get("last_real_question_at", 0.0),
+            },
+            "usage": {
+                "real_questions": stats.get("real_questions", 0),
+                "chat_requests": stats.get("chat_requests", 0),
+                "prompt_tokens": stats.get("prompt_tokens", 0),
+                "completion_tokens": stats.get("completion_tokens", 0),
+                "total_tokens": stats.get("total_tokens", 0),
+                "estimated_tokens": stats.get("estimated_tokens", 0),
+                "exact_tokens": stats.get("exact_tokens", 0),
+            },
+        }
 
     def _shutdown_gateway(self):
         with self._gateway_lock:
@@ -1198,14 +1487,33 @@ class MLXManagerWindow(QWidget):
                     if not self._authorized():
                         self._send_json(401, {"error": "Unauthorized"})
                         return
-                    manager._record_gateway_request('chat')
-                    manager._mark_activity()
-                    if not manager._ensure_server_running(reason="incoming request", fast_request_wake=True):
-                        self._send_json(503, {"error": "Model warming", "state": manager._gateway_models_payload().get("state")})
-                        return
                     length = int(self.headers.get("Content-Length", "0") or 0)
                     body = self.rfile.read(length)
+                    request_payload = manager._decode_json_body(body)
+                    real_question = manager._is_real_chat_question(request_payload)
+                    manager._record_gateway_request('question' if real_question else 'chat')
+                    if real_question:
+                        manager._record_real_question(request_payload)
+                        manager._mark_activity()
+                    elif not manager._server_process_active():
+                        self._send_json(
+                            202,
+                            {
+                                "state": manager._gateway_models_payload().get("state"),
+                                "message": "No real user question detected; model remains asleep/stopped.",
+                            },
+                        )
+                        return
+                    if not manager._ensure_server_running(
+                        reason="incoming request",
+                        fast_request_wake=True,
+                        count_as_activity=real_question,
+                    ):
+                        self._send_json(503, {"error": "Model warming", "state": manager._gateway_models_payload().get("state")})
+                        return
                     status, response_body, content_type = manager._forward_to_internal(path, body)
+                    if real_question and 200 <= status < 300:
+                        manager._record_token_usage(request_payload, response_body, content_type)
                     self.send_response(status)
                     self.send_header("Content-Type", content_type or "application/json")
                     self.send_header("Content-Length", str(len(response_body)))
@@ -1315,7 +1623,7 @@ class MLXManagerWindow(QWidget):
             payload = json.dumps({"error": str(exc), "state": state}).encode()
             return 504, payload, "application/json"
 
-    def _ensure_server_running(self, reason: str = "manual start", fast_request_wake: bool = False) -> bool:
+    def _ensure_server_running(self, reason: str = "manual start", fast_request_wake: bool = False, count_as_activity: bool = True) -> bool:
         with self._server_lock:
             preferred = self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
             running = check_server(self._internal_port(), host=INTERNAL_HOST, preferred_model=preferred)
@@ -1324,7 +1632,8 @@ class MLXManagerWindow(QWidget):
                 self._current_model = running
                 self._sleeping = False
                 self._deep_sleeping = False
-                self._mark_activity()
+                if count_as_activity:
+                    self._mark_activity()
                 self._sync_llm_os_if_needed(running, "running", log_fn=self._bridge.log_line.emit)
                 return True
 
@@ -1343,7 +1652,8 @@ class MLXManagerWindow(QWidget):
             self._bridge.status_set.emit("starting", f"Loading {mid.split('/')[-1]}…")
             if running and fast_request_wake:
                 self._running_id = running
-                self._mark_activity()
+                if count_as_activity:
+                    self._mark_activity()
                 self._bridge.status_set.emit("starting", f"Waking {running.split('/')[-1]}…")
                 return True
 
@@ -1358,7 +1668,8 @@ class MLXManagerWindow(QWidget):
             self._current_model = running
             self._sleeping = False
             self._deep_sleeping = False
-            self._mark_activity()
+            if count_as_activity:
+                self._mark_activity()
             if self._generation_ready:
                 self._bridge.status_set.emit("running", running.split("/")[-1])
                 self._sync_llm_os_if_needed(running, "running", log_fn=self._bridge.log_line.emit)
@@ -1443,19 +1754,38 @@ class MLXManagerWindow(QWidget):
 
     def _apply_status(self, state: str, label: str = ""):
         self._status = state
-        colours = {
-            "running":  (OK,   "●"),
-            "starting": (WARN, "◌"),
-            "stopping": (WARN, "◌"),
-            "sleeping": (WARN, "◐"),
-            "stopped":  (MUTED, "○"),
-            "error":    (ERR,  "✕"),
-            "unknown":  (MUTED, "?"),
+        self._status_changed_at = time.strftime("%I:%M %p").lstrip("0")
+        styles = {
+            "running":  (OK,   "●", "Running",     "#133222"),
+            "starting": (WARN, "◌", "Loading",     "#3a2b14"),
+            "stopping": (WARN, "◌", "Stopping",    "#3a2b14"),
+            "sleeping": (WARN, "◐", "Sleeping",    "#3a2b14"),
+            "stopped":  (MUTED, "○", "Stopped",    SURF2),
+            "error":    (ERR,  "✕", "Gateway Error", "#341a1c"),
+            "unknown":  (MUTED, "?", "Checking",   SURF2),
         }
-        col, sym = colours.get(state, (MUTED, "?"))
-        text = f"{sym} {label or state.upper()}"
-        self._status_lbl.setText(text)
-        self._status_lbl.setStyleSheet(f"color: {col}; background: transparent;")
+        col, sym, title, bg = styles.get(state, (MUTED, "?", "Checking", SURF2))
+        cleaned_label = (label or "").strip()
+        if state == "starting" and cleaned_label.lower().startswith("waking "):
+            title = "Waking"
+        elif state == "sleeping" and (self._deep_sleeping or "(deep)" in cleaned_label.lower()):
+            title = "Deep Sleep"
+            cleaned_label = cleaned_label.replace("(deep)", "").strip()
+        pill_text = f"{sym} {title}"
+        self._status_lbl.setText(pill_text)
+        self._status_lbl.setStyleSheet(
+            f"color: {col}; background: {bg}; border: 1px solid {col};"
+            " border-radius: 12px; padding: 4px 10px;"
+        )
+        meta_parts = []
+        if cleaned_label:
+            meta_parts.append(cleaned_label)
+        if self._status_changed_at:
+            meta_parts.append(self._status_changed_at)
+        meta_text = " • ".join(meta_parts)
+        self._status_meta_lbl.setText(meta_text)
+        self._status_meta_lbl.setVisible(bool(meta_text))
+        self._refresh_usage_status()
 
     def _append_log(self, msg: str):
         ts = time.strftime("%H:%M:%S")

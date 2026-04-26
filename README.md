@@ -29,6 +29,8 @@ The manager provides:
 - **idle sleep** with:
   - `Light (wake on request)`
   - `Deep (manual wake)`
+- **real-question idle tracking** so readiness checks and model-list calls do not keep the LLM awake
+- **token-use counters** for prompt/completion/total usage when the gateway can observe it
 - **wake-on-request** for light sleep
 - **optional runtime sync** so compatible clients can follow the selected model
 - **activity / timing logs** for startup, forwarding, and idle behavior
@@ -193,7 +195,8 @@ The manager logs important operational events, including:
 - readiness timing
 - request forward timing
 - forward timeouts/failures
-- idle timeout behavior
+- idle timeout behavior after real user questions
+- token-use summaries in the GUI
 - gateway activity summaries while paused
 
 Useful log lines include:
@@ -202,7 +205,7 @@ Useful log lines include:
 - `Forwarded request completed in ...s`
 - `Forward request failed after ...s (state=...)`
 - `Gateway activity while paused: ...`
-- `Idle timeout reached ...`
+- `No real question for ... min`
 
 ---
 
@@ -416,9 +419,10 @@ Check:
 - `Sleep when idle` is enabled
 - `Idle min` is set to the expected value
 - which sleep mode is active
-- whether the log shows repeated `POST /v1/chat/completions`
+- whether the GUI shows real questions being detected in `IDLE / TOKEN USE`
+- whether a client is sending non-probe `POST /v1/chat/completions` traffic
 
-`GET /v1/models` traffic should not count as activity.
+`GET /v1/models`, empty chat-completion bodies, and small `ping`/`health` probe prompts should not count as real activity.
 
 ### A client cannot reach the model
 
