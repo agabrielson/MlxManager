@@ -45,6 +45,8 @@ Core files in this folder:
   Main GUI application, embedded gateway, runtime control, and optional client-sync logic.
 - [mlx_manager_bootstrap.py](./mlx_manager_bootstrap.py)
   Stdlib-only first-run helper that creates `mlx-env`, installs dependencies, and relaunches the GUI.
+- [docs/c4_architecture.md](./docs/c4_architecture.md)
+  Full C4 architecture, state machine, and algorithm descriptions for startup, gateway forwarding, sleep/wake, token accounting, and client sync.
 - [assets/mlx_gui_icon.png](./assets/mlx_gui_icon.png)
   GUI icon asset.
 - [/.mlx_manager.json](./.mlx_manager.json)

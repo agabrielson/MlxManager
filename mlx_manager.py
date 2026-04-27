@@ -353,7 +353,8 @@ class MLXManagerWindow(QWidget):
         self.setWindowTitle("MLX-LM Model Manager")
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.resize(720, 580)
+        self.resize(1180, 720)
+        self.setMinimumSize(960, 600)
 
         self._bridge       = _Bridge()
         self._bridge.log_line.connect(self._append_log)
@@ -469,8 +470,14 @@ class MLXManagerWindow(QWidget):
         self._status_meta_lbl.setFont(QFont("Menlo", 9))
         self._status_meta_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
 
+        self._header_tokens_lbl = QLabel("Tokens: 0")
+        self._header_tokens_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._header_tokens_lbl.setFont(QFont("Menlo", 10, QFont.Weight.Bold))
+        self._header_tokens_lbl.setStyleSheet(f"color: {ACC2}; background: transparent;")
+
         status_layout.addWidget(self._status_lbl, alignment=Qt.AlignmentFlag.AlignRight)
         status_layout.addWidget(self._status_meta_lbl, alignment=Qt.AlignmentFlag.AlignRight)
+        status_layout.addWidget(self._header_tokens_lbl, alignment=Qt.AlignmentFlag.AlignRight)
 
         hdr_layout.addWidget(title)
         hdr_layout.addStretch()
@@ -483,6 +490,29 @@ class MLXManagerWindow(QWidget):
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(20, 16, 20, 16)
         body_layout.setSpacing(16)
+
+        log_container = QWidget()
+        log_container.setMinimumWidth(400)
+        log_container.setStyleSheet(f"background: {BG};")
+        log_layout = QVBoxLayout(log_container)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(6)
+
+        log_lbl = QLabel("LOG")
+        log_lbl.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
+        log_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        log_layout.addWidget(log_lbl)
+
+        self._log_box = QTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setFont(QFont("Menlo", 10))
+        self._log_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._log_box.setStyleSheet(
+            f"background: {SURF}; color: {TEXT}; border: none;"
+            f" border-radius: 4px; padding: 8px;"
+        )
+        log_layout.addWidget(self._log_box, stretch=1)
+        body_layout.addWidget(log_container, stretch=2)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -626,7 +656,7 @@ class MLXManagerWindow(QWidget):
         usage_layout.addWidget(self._idle_state_lbl)
 
         self._usage_tokens_lbl = QLabel("")
-        self._usage_tokens_lbl.setFont(QFont("Menlo", 9))
+        self._usage_tokens_lbl.setFont(QFont("Menlo", 10, QFont.Weight.Bold))
         self._usage_tokens_lbl.setWordWrap(True)
         self._usage_tokens_lbl.setStyleSheet(f"color: {ACC2}; background: transparent;")
         usage_layout.addWidget(self._usage_tokens_lbl)
@@ -713,30 +743,6 @@ class MLXManagerWindow(QWidget):
 
         body_layout.addWidget(ctrl)
         root_layout.addWidget(body, stretch=1)
-        root_layout.addWidget(self._divider(margin=20))
-
-        log_container = QWidget()
-        log_container.setStyleSheet(f"background: {BG};")
-        log_layout = QVBoxLayout(log_container)
-        log_layout.setContentsMargins(20, 8, 20, 16)
-        log_layout.setSpacing(4)
-
-        log_lbl = QLabel("LOG")
-        log_lbl.setFont(QFont("Helvetica", 9, QFont.Weight.Bold))
-        log_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
-        log_layout.addWidget(log_lbl)
-
-        self._log_box = QTextEdit()
-        self._log_box.setReadOnly(True)
-        self._log_box.setFont(QFont("Menlo", 10))
-        self._log_box.setStyleSheet(
-            f"background: {SURF}; color: {TEXT}; border: none;"
-            f" border-radius: 4px; padding: 8px;"
-        )
-        self._log_box.setFixedHeight(180)
-        log_layout.addWidget(self._log_box)
-
-        root_layout.addWidget(log_container)
         self._set_cached_models(self.models)
         self._refresh_setup_status()
         self._refresh_usage_status()
@@ -1313,9 +1319,14 @@ class MLXManagerWindow(QWidget):
         questions = stats.get("real_questions", 0)
         source = stats.get("last_token_source", "none")
         last_total = stats.get("last_total_tokens", 0)
+        if hasattr(self, "_header_tokens_lbl"):
+            self._header_tokens_lbl.setText(
+                f"Tokens: {total:,} total • last {last_total:,}"
+            )
         self._usage_tokens_lbl.setText(
-            f"Tokens: {total:,} total ({prompt:,} prompt / {completion:,} completion) • "
-            f"{questions:,} real questions • last {last_total:,} [{source}]"
+            f"Tokens used: {total:,} total\n"
+            f"Prompt: {prompt:,}  •  Completion: {completion:,}\n"
+            f"Questions: {questions:,}  •  Last: {last_total:,} [{source}]"
         )
 
         last_at = stats.get("last_real_question_at", 0.0)
