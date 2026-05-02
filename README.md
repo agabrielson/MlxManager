@@ -340,7 +340,8 @@ flowchart TD
 Important implementation ideas:
 
 - **bridge signals** are used to get UI-safe behavior across worker threads
-- **idle timing** is now a Qt-thread concern, not a background-thread concern
+- **idle timing** uses the Qt timer plus a lightweight watchdog so a stale UI
+  state cannot keep the model awake past the configured idle deadline
 - **gateway** accepts local requests and can trigger startup/wake behavior
 - **startup worker** handles bounded readiness loops
 - **bootstrap helper** keeps first-run install/repair out of the GUI’s critical path

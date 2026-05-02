@@ -91,6 +91,7 @@ DEFAULT_IDLE_ENABLED = True
 DEFAULT_SLEEP_MODE = "light"
 GATEWAY_POLL_INTERVAL_S = 120.0
 GATEWAY_STATS_WINDOW_S = 300.0
+IDLE_WATCHDOG_INTERVAL_S = 30.0
 STARTUP_TIMEOUT_S = 90
 STARTUP_REQUEST_TIMEOUT_S = 25
 INTERNAL_FORWARD_TIMEOUT_S = 45
@@ -342,6 +343,7 @@ class _Bridge(QObject):
     setup_refresh = pyqtSignal()
     activity_pulse = pyqtSignal()
     idle_timer_stop = pyqtSignal()
+    idle_timeout_request = pyqtSignal()
     usage_refresh = pyqtSignal()
 
 
@@ -364,6 +366,7 @@ class MLXManagerWindow(QWidget):
         self._bridge.setup_refresh.connect(self._refresh_setup_status)
         self._bridge.activity_pulse.connect(self._apply_activity_pulse)
         self._bridge.idle_timer_stop.connect(self._stop_idle_timer)
+        self._bridge.idle_timeout_request.connect(self._on_idle_timeout)
         self._bridge.usage_refresh.connect(self._refresh_usage_status)
 
         self._settings     = load_settings()
@@ -403,6 +406,8 @@ class MLXManagerWindow(QWidget):
         self._startup_error = None
         self._startup_model = None
         self._startup_started_at = 0.0
+        self._shutdown_requested = False
+        self._idle_watchdog_thread = None
         self._expected_exit_pid = None
         self._expected_exit_reason = ""
         self._gateway_request_times = deque()
@@ -418,6 +423,7 @@ class MLXManagerWindow(QWidget):
 
         self._build_ui()
         self._setup_timers()
+        self._start_idle_watchdog()
         self._ensure_gateway_running()
         QTimer.singleShot(250, self._on_refresh_available_models)
 
@@ -915,6 +921,28 @@ class MLXManagerWindow(QWidget):
         self._idle_timer.setSingleShot(True)
         self._idle_timer.timeout.connect(self._on_idle_timeout)
 
+    def _start_idle_watchdog(self):
+        if self._idle_watchdog_thread and self._idle_watchdog_thread.is_alive():
+            return
+
+        def _watchdog():
+            while not self._shutdown_requested:
+                time.sleep(IDLE_WATCHDOG_INTERVAL_S)
+                try:
+                    enabled, idle_seconds, _sleep_mode = self._idle_config_snapshot()
+                    if not enabled or self._sleeping or self._deep_sleeping:
+                        continue
+                    if not self._server_process_active():
+                        continue
+                    reference = self._idle_reference_time()
+                    if reference and (time.time() - reference) >= idle_seconds:
+                        self._bridge.idle_timeout_request.emit()
+                except Exception as exc:
+                    self._bridge.log_line.emit(f"  Idle watchdog warning: {exc}")
+
+        self._idle_watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        self._idle_watchdog_thread.start()
+
     def _on_idle_config_changed(self):
         self._persist_settings()
         self._arm_idle_timer()
@@ -964,20 +992,23 @@ class MLXManagerWindow(QWidget):
     def _arm_idle_timer(self):
         if not hasattr(self, "_idle_timer"):
             return
-        if self._idle_enabled() and not self._sleeping and (self._generation_ready or bool(self.server_proc and self.server_proc.poll() is None)):
-            self._idle_timer.start(max(1000, int(self._idle_seconds() * 1000)))
+        enabled, idle_seconds, _sleep_mode = self._idle_config_snapshot()
+        if enabled and not self._sleeping and (self._generation_ready or bool(self.server_proc and self.server_proc.poll() is None)):
+            self._idle_timer.start(max(1000, int(idle_seconds * 1000)))
         else:
             self._idle_timer.stop()
 
     def _on_idle_timeout(self):
         current = self._running_id or self._current_model or self._selected_model()
-        if not current or not self._idle_enabled():
+        enabled, _idle_seconds, sleep_mode = self._idle_config_snapshot()
+        if not current or not enabled:
             return
-        if self._sleep_mode() == "deep":
-            self._append_log(f"⏸ No real question for {self._idle_minutes():g} min; entering deep sleep to save battery.")
+        idle_minutes = max(1.0, _idle_seconds / 60.0)
+        if sleep_mode == "deep":
+            self._append_log(f"⏸ No real question for {idle_minutes:g} min; entering deep sleep to save battery.")
             self._enter_deep_sleep(reason="idle timeout")
             return
-        self._append_log(f"⏸ No real question for {self._idle_minutes():g} min; pausing model to save battery.")
+        self._append_log(f"⏸ No real question for {idle_minutes:g} min; pausing model to save battery.")
         self._stop_model_server(reason="idle timeout", sleeping=True)
 
     def _refresh_dots(self, running_id: Optional[str]):
@@ -1144,6 +1175,32 @@ class MLXManagerWindow(QWidget):
     def _sleep_mode(self) -> str:
         return (self._sleep_mode_combo.currentData() or DEFAULT_SLEEP_MODE) if hasattr(self, "_sleep_mode_combo") else DEFAULT_SLEEP_MODE
 
+    def _idle_config_snapshot(self) -> tuple[bool, float, str]:
+        """Return the effective idle policy.
+
+        The saved settings file is treated as the source of truth because the
+        long-running GUI can be older than the on-disk settings after repair or
+        restart work. UI changes are persisted immediately, so this still honors
+        user changes while preventing stale in-memory controls from disabling
+        battery-saving sleep.
+        """
+        settings = load_settings()
+        if settings:
+            enabled = bool(settings.get("idle_enabled", DEFAULT_IDLE_ENABLED))
+            try:
+                minutes = max(1.0, float(settings.get("idle_minutes", DEFAULT_IDLE_MINUTES)))
+            except Exception:
+                minutes = float(DEFAULT_IDLE_MINUTES)
+            sleep_mode = str(settings.get("sleep_mode", DEFAULT_SLEEP_MODE) or DEFAULT_SLEEP_MODE)
+            if sleep_mode not in {"light", "deep"}:
+                sleep_mode = DEFAULT_SLEEP_MODE
+            return enabled, minutes * 60.0, sleep_mode
+        return self._idle_enabled(), self._idle_seconds(), self._sleep_mode()
+
+    def _idle_reference_time(self) -> float:
+        stats = self._token_stats_snapshot()
+        return max(float(stats.get("last_real_question_at") or 0.0), float(self._last_activity or 0.0))
+
     def _format_clock(self, ts: float) -> str:
         if not ts:
             return "never"
@@ -1296,14 +1353,15 @@ class MLXManagerWindow(QWidget):
         if not hasattr(self, "_idle_state_lbl"):
             return
         stats = self._token_stats_snapshot()
-        idle_minutes = self._idle_minutes()
+        idle_enabled, idle_seconds, sleep_mode = self._idle_config_snapshot()
+        idle_minutes = max(1.0, idle_seconds / 60.0)
         if self._sleeping or self._deep_sleeping:
             if self._deep_sleeping:
                 idle_text = f"Deep sleep active. Use Load & Start to wake. Idle policy: {idle_minutes:g} min."
             else:
                 idle_text = f"Sleeping now. The next real question wakes the last model. Idle policy: {idle_minutes:g} min."
             idle_color = WARN
-        elif self._idle_enabled():
+        elif idle_enabled:
             idle_text = f"Idle sleep ON: pauses after {idle_minutes:g} min without a real user question."
             idle_color = OK
         else:
@@ -1380,18 +1438,20 @@ class MLXManagerWindow(QWidget):
         startup_inflight = self._startup_inflight()
         ready_model = self._running_id if (self._generation_ready and proc_running) else None
         model_id = ready_model or self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
+        idle_enabled, idle_seconds, sleep_mode = self._idle_config_snapshot()
+        sleep_available = bool(model_id and idle_enabled and not proc_running and not startup_inflight)
         data = []
         if model_id:
             data.append({
                 "id": model_id,
                 "object": "model",
                 "owned_by": "mlx-community",
-                "state": "running" if ready_model else ("sleeping" if self._sleeping else "warming"),
+                "state": "running" if ready_model else ("sleeping" if (self._sleeping or sleep_available) else "warming"),
                 "ready": bool(ready_model),
             })
         if ready_model:
             state = "running"
-        elif self._sleeping:
+        elif self._sleeping or sleep_available:
             state = "sleeping"
         elif proc_running or startup_inflight or model_id:
             state = "warming"
@@ -1403,9 +1463,9 @@ class MLXManagerWindow(QWidget):
             "data": data,
             "state": state,
             "idle": {
-                "enabled": self._idle_enabled(),
-                "minutes": self._idle_minutes(),
-                "sleep_mode": self._sleep_mode(),
+                "enabled": idle_enabled,
+                "minutes": max(1.0, idle_seconds / 60.0),
+                "sleep_mode": sleep_mode,
                 "last_real_question_at": stats.get("last_real_question_at", 0.0),
             },
             "usage": {
@@ -1809,6 +1869,7 @@ class MLXManagerWindow(QWidget):
         self._setup_status_box.setPlainText("\n".join(startup_diagnostics(self.mlx_binary)))
 
     def closeEvent(self, event):
+        self._shutdown_requested = True
         self._persist_settings()
         try:
             self._stop_model_server(reason="window close", sleeping=False)

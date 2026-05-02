@@ -149,7 +149,7 @@ flowchart LR
     lifecycle["_start_model_thread / _stop_model_process / kill_all_servers"]
     gateway["_ensure_gateway_running / GatewayHandler"]
     forward["_forward_to_internal"]
-    idle["_setup_timers / _on_idle_timeout / _sleep_model"]
+    idle["_setup_timers / _start_idle_watchdog / _on_idle_timeout / _sleep_model"]
     usage["_record_real_question / _record_token_usage / _refresh_usage_status"]
     sync["sync_llm_os_local_model"]
 
@@ -290,14 +290,15 @@ This prevents monitoring traffic from keeping the model awake.
 
 Goal: save battery without requiring a manual restart for normal use.
 
-1. The Qt idle timer checks elapsed time since `_last_real_question_at`.
-2. If idle sleep is enabled and the threshold is exceeded, stop the MLX subprocess.
-3. Keep the gateway alive.
-4. Preserve `_current_model` and last-running model settings.
-5. Mark status as sleeping.
-6. When a real chat request arrives, start the last selected model.
-7. Wait for generation readiness.
-8. Forward the original request after the model is ready.
+1. The Qt idle timer checks elapsed time since real model activity.
+2. A lightweight watchdog also checks the saved idle policy and last real-question/activity timestamp.
+3. If idle sleep is enabled and the threshold is exceeded, stop the MLX subprocess.
+4. Keep the gateway alive.
+5. Preserve `_current_model` and last-running model settings.
+6. Mark status as sleeping.
+7. When a real chat request arrives, start the last selected model.
+8. Wait for generation readiness.
+9. Forward the original request after the model is ready.
 
 Tradeoff:
 
@@ -428,4 +429,3 @@ Use this checklist when changing the manager:
 - In light sleep, send a real chat request and confirm wake-on-request.
 - In deep sleep, confirm the gateway stops and manual wake is required.
 - Confirm `Stop All` terminates the MLX subprocess and updates status.
-
