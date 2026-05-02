@@ -151,7 +151,7 @@ In practice, if a client is running in Docker, `All Interfaces` is usually the c
 
 ## Gateway Auth
 
-The embedded gateway supports optional bearer-token auth.
+The embedded gateway supports bearer-token auth. Auth defaults on for the secure path, and the user can explicitly disable it in the GUI for isolated local experiments.
 
 If enabled:
 
@@ -165,6 +165,8 @@ sk-mytoken
 ```
 
 But the user can set any token in the GUI.
+
+When the token, auth toggle, host mode, or gateway port changes, MLX Manager persists the new gateway settings and re-syncs compatible clients such as LLM-OS. The sync cache includes the model, visible state, base URL, auth flag, and effective token so a token-only change is not skipped as a duplicate model update.
 
 ---
 
@@ -414,6 +416,12 @@ Check the log for:
 - `Forward request failed after ...s`
 
 This usually means the gateway is up but the model is still warming or timing out.
+
+Current behavior:
+
+- Light sleep should wake on the first real chat request.
+- If the internal MLX server briefly reports `Model warming`, the gateway retries the forwarded request before returning an error.
+- Compatible clients should also treat MLX warmup errors as retryable because wake latency is normal after sleep.
 
 ### Idle sleep does not trigger
 

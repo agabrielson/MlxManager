@@ -271,8 +271,11 @@ flowchart TD
     probe -->|"probe"| forward_probe["Forward without idle reset"]
     probe -->|"real question"| wake["Mark real question and wake if needed"]
     wake --> forward["Forward to internal mlx_lm"]
+    forward --> warm{"Warming response?"}
+    warm -->|"yes"| retry["Short bounded retry"]
+    retry --> forward
+    warm -->|"no"| usage["Record usage if successful"]
     forward_probe --> forward
-    forward --> usage["Record usage if successful"]
 ```
 
 Real-question detection excludes:
@@ -299,6 +302,7 @@ Goal: save battery without requiring a manual restart for normal use.
 7. When a real chat request arrives, start the last selected model.
 8. Wait for generation readiness.
 9. Forward the original request after the model is ready.
+10. If the internal server still returns a transient warming response, retry the forward briefly before surfacing an error.
 
 Tradeoff:
 
@@ -360,6 +364,16 @@ Goal: make compatible tools discover the currently selected local model without 
 6. Apply auth settings if gateway auth is enabled.
 7. Persist the client config.
 8. Log whether sync succeeded or was skipped.
+
+Duplicate-sync suppression uses a full connection signature:
+
+- selected model
+- reported state
+- client-visible base URL
+- auth-enabled flag
+- effective gateway token when auth is enabled
+
+This prevents a token-only or host-only change from being skipped just because the same model is still selected.
 
 Safety rule:
 

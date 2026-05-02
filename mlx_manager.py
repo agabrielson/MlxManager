@@ -89,6 +89,7 @@ INTERNAL_PORT_OFFSET = 1
 DEFAULT_IDLE_MINUTES = 15
 DEFAULT_IDLE_ENABLED = True
 DEFAULT_SLEEP_MODE = "light"
+DEFAULT_AUTH_ENABLED = True
 GATEWAY_POLL_INTERVAL_S = 120.0
 GATEWAY_STATS_WINDOW_S = 300.0
 IDLE_WATCHDOG_INTERVAL_S = 30.0
@@ -181,7 +182,7 @@ def load_settings() -> dict:
         if "host_mode_user_set" not in settings:
             settings["host_mode"] = "all"
         if "auth_enabled" not in settings:
-            settings["auth_enabled"] = False
+            settings["auth_enabled"] = DEFAULT_AUTH_ENABLED
         if "auth_token" not in settings:
             settings["auth_token"] = DEFAULT_GATEWAY_TOKEN
         if "idle_enabled" not in settings:
@@ -400,6 +401,7 @@ class MLXManagerWindow(QWidget):
         }
         self._last_synced_model = None
         self._last_synced_state = None
+        self._last_synced_signature = None
         self._startup_event = threading.Event()
         self._startup_event.set()
         self._startup_thread = None
@@ -568,6 +570,7 @@ class MLXManagerWindow(QWidget):
         host_mode = self._settings.get("host_mode", "all")
         idx = self._host_mode_combo.findData(host_mode)
         self._host_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._host_mode_combo.currentIndexChanged.connect(lambda _idx: self._on_gateway_config_changed(restart_gateway=True))
         ctrl_layout.addWidget(self._host_mode_combo)
 
         port_lbl = QLabel("Gateway Port")
@@ -581,11 +584,13 @@ class MLXManagerWindow(QWidget):
             f"background: {SURF2}; color: {TEXT}; border: none;"
             f" border-radius: 4px; padding: 4px 8px;"
         )
+        self._port_entry.editingFinished.connect(lambda: self._on_gateway_config_changed(restart_gateway=True))
         ctrl_layout.addWidget(self._port_entry)
 
         self._auth_toggle = QCheckBox("Require gateway token")
         self._auth_toggle.setChecked(bool(self._settings.get("auth_enabled", False)))
         self._auth_toggle.setStyleSheet(f"color: {TEXT};")
+        self._auth_toggle.stateChanged.connect(lambda _state: self._on_gateway_config_changed())
         ctrl_layout.addWidget(self._auth_toggle)
 
         self._auth_token_entry = QLineEdit(self._settings.get("auth_token", DEFAULT_GATEWAY_TOKEN))
@@ -595,6 +600,7 @@ class MLXManagerWindow(QWidget):
             f"background: {SURF2}; color: {TEXT}; border: none;"
             f" border-radius: 4px; padding: 4px 8px;"
         )
+        self._auth_token_entry.editingFinished.connect(lambda: self._on_gateway_config_changed())
         ctrl_layout.addWidget(self._auth_token_entry)
 
         self._idle_toggle = QCheckBox("Sleep when idle")
@@ -840,6 +846,16 @@ class MLXManagerWindow(QWidget):
         self._persist_settings()
         self._append_log(f"↺ Refreshed: {len(self.models)} model(s) in cache")
         self._ensure_gateway_running()
+
+    def _on_gateway_config_changed(self, restart_gateway: bool = False):
+        """Persist gateway settings and push the effective connection to llm-os."""
+        self._persist_settings()
+        self._last_synced_signature = None
+        if restart_gateway:
+            self._shutdown_gateway()
+            self._ensure_gateway_running()
+        self._sync_current_llm_os_state(force=True, reason="gateway config change")
+        self._refresh_usage_status()
 
     def _on_refresh_available_models(self):
         if self._hf_api is None:
@@ -1111,12 +1127,15 @@ class MLXManagerWindow(QWidget):
         return token or self._default_hf_token()
 
     def _persist_settings(self):
+        auth_enabled = self._auth_enabled()
+        raw_auth_token = self._auth_token_entry.text().strip() if hasattr(self, "_auth_token_entry") else ""
+        auth_token = raw_auth_token or (DEFAULT_GATEWAY_TOKEN if auth_enabled else "")
         settings = {
             "host_mode": self._gateway_host_mode(),
             "host_mode_user_set": True,
             "port": self._port(),
-            "auth_enabled": self._auth_enabled(),
-            "auth_token": self._auth_token_entry.text().strip() if hasattr(self, "_auth_token_entry") else "",
+            "auth_enabled": auth_enabled,
+            "auth_token": auth_token,
             "idle_enabled": self._idle_enabled(),
             "idle_minutes": self._idle_minutes(),
             "sleep_mode": self._sleep_mode(),
@@ -1413,10 +1432,22 @@ class MLXManagerWindow(QWidget):
         question_hits = sum(1 for _, kind in self._gateway_request_times if kind == 'question')
         return f"{len(self._gateway_request_times)} requests in last 5m ({model_hits} models, {chat_hits} chat, {question_hits} real questions)"
 
-    def _sync_llm_os_if_needed(self, model_id: Optional[str], state: str, log_fn=None):
+    def _sync_llm_os_if_needed(self, model_id: Optional[str], state: str, log_fn=None, force: bool = False):
         if not model_id:
             return False
-        if self._last_synced_model == model_id and self._last_synced_state == state:
+        signature = (
+            model_id,
+            state,
+            self._gateway_client_base_url(),
+            bool(self._auth_enabled()),
+            self._auth_token() if self._auth_enabled() else "",
+        )
+        if (
+            not force
+            and self._last_synced_signature == signature
+            and self._last_synced_model == model_id
+            and self._last_synced_state == state
+        ):
             return False
         ok = sync_llm_os_local_model(
             model_id,
@@ -1428,7 +1459,33 @@ class MLXManagerWindow(QWidget):
         if ok:
             self._last_synced_model = model_id
             self._last_synced_state = state
+            self._last_synced_signature = signature
         return ok
+
+    def _sync_current_llm_os_state(self, *, force: bool = False, reason: str = "state sync"):
+        model_id = self._running_id or self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
+        if not model_id:
+            return False
+        if self._generation_ready and self._server_process_active():
+            state = "running"
+        elif self._sleeping or self._deep_sleeping:
+            state = "sleeping"
+        elif self._startup_inflight():
+            state = "warming"
+        else:
+            idle_enabled, _idle_seconds, _sleep_mode = self._idle_config_snapshot()
+            state = "sleeping" if idle_enabled and not self._server_process_active() else "stopped"
+
+        def _worker():
+            self._sync_llm_os_if_needed(
+                model_id,
+                state,
+                log_fn=self._bridge.log_line.emit,
+                force=force,
+            )
+
+        threading.Thread(target=_worker, daemon=True, name=f"llm-os-sync-{reason}").start()
+        return True
 
     def _startup_inflight(self) -> bool:
         return bool(self._startup_thread and self._startup_thread.is_alive())
@@ -1675,24 +1732,46 @@ class MLXManagerWindow(QWidget):
         )
         started_at = time.time()
         timeout_s = INTERNAL_READY_TIMEOUT_S if self._generation_ready else INTERNAL_FORWARD_TIMEOUT_S
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                self._generation_ready = True
-                if self._running_id or self._current_model:
-                    self._bridge.status_set.emit("running", (self._running_id or self._current_model).split("/")[-1])
-                    self._sync_llm_os_if_needed(self._running_id or self._current_model, "running", log_fn=self._bridge.log_line.emit)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    self._generation_ready = True
+                    if self._running_id or self._current_model:
+                        self._bridge.status_set.emit("running", (self._running_id or self._current_model).split("/")[-1])
+                        self._sync_llm_os_if_needed(self._running_id or self._current_model, "running", log_fn=self._bridge.log_line.emit)
+                    elapsed = time.time() - started_at
+                    if elapsed >= 2.0:
+                        self._bridge.log_line.emit(f"  Forwarded request completed in {elapsed:.1f}s")
+                    return resp.status, resp.read(), resp.headers.get_content_type()
+            except urllib.error.HTTPError as exc:
+                body = exc.read()
+                text = body.decode(errors="replace")
+                if attempt < 2 and self._is_retryable_warm_response(exc.code, text):
+                    self._bridge.log_line.emit("  Internal server is still warming; retrying forwarded request…")
+                    time.sleep(2.0)
+                    continue
+                return exc.code, body, exc.headers.get_content_type()
+            except Exception as exc:
                 elapsed = time.time() - started_at
-                if elapsed >= 2.0:
-                    self._bridge.log_line.emit(f"  Forwarded request completed in {elapsed:.1f}s")
-                return resp.status, resp.read(), resp.headers.get_content_type()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(), exc.headers.get_content_type()
-        except Exception as exc:
-            elapsed = time.time() - started_at
-            state = self._gateway_models_payload().get("state")
-            self._bridge.log_line.emit(f"  Forward request failed after {elapsed:.1f}s (state={state}): {exc}")
-            payload = json.dumps({"error": str(exc), "state": state}).encode()
-            return 504, payload, "application/json"
+                state = self._gateway_models_payload().get("state")
+                self._bridge.log_line.emit(f"  Forward request failed after {elapsed:.1f}s (state={state}): {exc}")
+                payload = json.dumps({"error": str(exc), "state": state}).encode()
+                return 504, payload, "application/json"
+
+        payload = json.dumps({"error": "Model warming", "state": self._gateway_models_payload().get("state")}).encode()
+        return 503, payload, "application/json"
+
+    @staticmethod
+    def _is_retryable_warm_response(status_code: int, body: str) -> bool:
+        if status_code not in {202, 503, 504}:
+            return False
+        try:
+            payload = json.loads(body or "{}")
+        except Exception:
+            payload = {}
+        state = str(payload.get("state") or "").lower()
+        message = str(payload.get("message") or payload.get("error") or body or "").lower()
+        return state in {"warming", "starting", "sleeping", "running"} or "warming" in message or "waking" in message
 
     def _ensure_server_running(self, reason: str = "manual start", fast_request_wake: bool = False, count_as_activity: bool = True) -> bool:
         with self._server_lock:
