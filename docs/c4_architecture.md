@@ -41,7 +41,7 @@ MLX Manager is an operator-facing control plane for local MLX inference. It is n
 flowchart LR
     subgraph app["MLX Manager desktop process"]
         gui["PyQt6 GUI"]
-        gateway["ThreadingHTTPServer gateway\n/v1/models\n/v1/chat/completions"]
+        gateway["ThreadingHTTPServer gateway\nHTTP or HTTPS/TLS\n/v1/models\n/v1/chat/completions"]
         runtime["Runtime controller\nstart/stop/wake/sleep"]
         telemetry["Telemetry model\nstatus, logs, tokens, requests"]
         sync["Optional client sync\nLLM-OS config update"]
@@ -50,6 +50,7 @@ flowchart LR
 
     subgraph local["Local machine"]
         settings[".mlx_manager.json"]
+        certs["TLS cert/key\ncerts/ or custom path"]
         cache["Hugging Face cache"]
         server["mlx_lm server subprocess\ninternal host/port"]
     end
@@ -69,6 +70,7 @@ flowchart LR
     runtime --> telemetry
     sync --> client
     config --> settings
+    config --> certs
     gui --> cache
     gui --> hf
     client --> gateway
@@ -252,6 +254,7 @@ Detailed steps:
 Design choice:
 
 - The internal MLX server stays bound to localhost. The manager gateway decides whether external clients can reach it.
+- The gateway can expose either HTTP or HTTPS/TLS. In HTTPS mode, the manager wraps the gateway socket with a server-side SSL context before the serving thread starts.
 
 ---
 
@@ -261,9 +264,13 @@ Goal: expose a stable OpenAI-compatible endpoint while separating probes from re
 
 ```mermaid
 flowchart TD
-    req["Incoming HTTP request"] --> auth{"Auth enabled?"}
+    tls["Optional TLS setup\ncert/key load or default self-signed generation"] --> req["Incoming HTTP/HTTPS request"]
+    req --> auth{"Auth enabled?"}
     auth -->|"yes, missing/invalid"| reject["401"]
     auth -->|"no or valid"| route{"Path"}
+    route -->|"/health"| health["Return gateway-alive status"]
+    route -->|"/ready"| ready["Return model readiness\n200 ready / 503 warming or sleeping"]
+    route -->|"/status"| status["Return full machine state"]
     route -->|"/v1/models"| models["Return gateway model list"]
     route -->|"/v1/chat/completions"| classify["Classify request"]
     route -->|"other"| notfound["404"]
@@ -271,21 +278,45 @@ flowchart TD
     probe -->|"probe"| forward_probe["Forward without idle reset"]
     probe -->|"real question"| wake["Mark real question and wake if needed"]
     wake --> forward["Forward to internal mlx_lm"]
-    forward --> warm{"Warming response?"}
+    forward --> stream{"stream=true?"}
+    stream -->|"yes"| sse["Relay SSE stream"]
+    stream -->|"no"| warm{"Warming response?"}
     warm -->|"yes"| retry["Short bounded retry"]
     retry --> forward
     warm -->|"no"| usage["Record usage if successful"]
+    sse --> usage
     forward_probe --> forward
 ```
 
 Real-question detection excludes:
 
 - `GET /v1/models`
+- `GET /health`
+- `GET /ready`
+- `GET /status`
 - empty chat-completion requests
 - health/readiness prompts such as `ping` or `READY`
 - very small probe completions with low `max_tokens`
 
 This prevents monitoring traffic from keeping the model awake.
+
+Gateway status contract:
+
+- `GET /health` is a gateway liveness check and returns `200` if the manager gateway is alive.
+- `GET /ready` is a model readiness check and returns `200` only when generation is ready; warming, sleeping, and stopped states return `503` with `Retry-After`.
+- `GET /status` returns full state, model, idle, usage, gateway, and internal runtime details, and follows bearer-token auth when auth is enabled.
+- `GET /status` also reports gateway protocol, TLS enabled/disabled state, certificate path, self-signed indicator, and the client certificate-verification preference.
+- `GET /v1/models` remains OpenAI-compatible, with extra state metadata for clients that can use it.
+- Retryable errors use an OpenAI-style `{"error": {"message", "type", "code", "state"}}` envelope plus top-level `message` and `state` for simple clients.
+
+### Gateway TLS Algorithm
+
+1. Read `gateway_scheme`, `gateway_cert_file`, `gateway_key_file`, and `client_verify_ssl` from `.mlx_manager.json`.
+2. If the scheme is `http`, start the gateway with a normal `ThreadingHTTPServer` socket.
+3. If the scheme is `https`, ensure a certificate/key pair exists.
+4. If the default cert/key paths are selected and missing, generate a local self-signed certificate with SANs for `localhost`, `127.0.0.1`, and `host.docker.internal`.
+5. Build a server-side `ssl.SSLContext`, require at least TLS 1.2, load the cert/key pair, and wrap the gateway socket before `serve_forever` starts.
+6. Include the final `https://...` base URL and SSL verification preference when syncing LLM-OS.
 
 ---
 
@@ -334,9 +365,10 @@ Goal: give the user practical visibility into model usage without requiring prov
 
 1. On successful chat completion responses, parse the response body.
 2. If the response includes OpenAI-style `usage`, use exact counts.
-3. Otherwise estimate prompt tokens from request messages.
-4. Estimate completion tokens from the assistant response text.
-5. Update cumulative totals:
+3. For streaming responses, buffer a bounded copy of the stream for best-effort usage accounting.
+4. Otherwise estimate prompt tokens from request messages.
+5. Estimate completion tokens from the assistant response text.
+6. Update cumulative totals:
    - real questions
    - prompt tokens
    - completion tokens
@@ -344,7 +376,7 @@ Goal: give the user practical visibility into model usage without requiring prov
    - exact-token total
    - estimated-token total
    - last request token count
-6. Refresh both the header token summary and the detailed token-use panel.
+7. Refresh both the header token summary and the detailed token-use panel.
 
 Important caveat:
 
@@ -438,7 +470,11 @@ Use this checklist when changing the manager:
 - Confirm the upper-right token summary is visible.
 - Start a cached model and verify status reaches running.
 - Call `GET /v1/models`; confirm it does not count as a real question.
+- Call `GET /health`; confirm it returns `200`.
+- Call `GET /ready`; confirm it returns `200` only when the model is generation-ready.
+- Call `GET /status`; confirm it reports state, usage, idle policy, and ports.
 - Send a small real chat completion; confirm real-question count and token counters update.
+- Send a streaming chat completion; confirm chunks are relayed and the request completes.
 - Wait for idle timeout or temporarily lower idle minutes; confirm sleep state is visible.
 - In light sleep, send a real chat request and confirm wake-on-request.
 - In deep sleep, confirm the gateway stops and manual wake is required.

@@ -25,6 +25,7 @@ The manager provides:
 - **first-run bootstrap** via `mlx_manager_bootstrap.py`
 - **Hugging Face model browsing and download**
 - **OpenAI-compatible local gateway** for apps and clients
+- **standard health/readiness/status endpoints** for supervisors and clients
 - **optional gateway bearer token**
 - **idle sleep** with:
   - `Light (wake on request)`
@@ -32,6 +33,7 @@ The manager provides:
 - **real-question idle tracking** so readiness checks and model-list calls do not keep the LLM awake
 - **token-use counters** for prompt/completion/total usage when the gateway can observe it
 - **wake-on-request** for light sleep
+- **streaming response passthrough** for OpenAI-compatible clients that request `stream=true`
 - **optional runtime sync** so compatible clients can follow the selected model
 - **activity / timing logs** for startup, forwarding, and idle behavior
 
@@ -124,6 +126,8 @@ Typical persisted values include:
 - last running model
 - gateway host mode
 - gateway port
+- gateway protocol (`http` or `https`)
+- TLS certificate/key paths when HTTPS is selected
 - gateway auth toggle/token
 - idle sleep toggle
 - idle minutes
@@ -149,6 +153,19 @@ In practice, if a client is running in Docker, `All Interfaces` is usually the c
 
 ---
 
+## Gateway Transport: HTTP Or HTTPS
+
+The embedded gateway can run as either plain HTTP or HTTPS/TLS.
+
+- **HTTP** is useful for localhost-only experiments and keeps compatibility with simple local tools.
+- **HTTPS/TLS** is the preferred option when the gateway is reachable over a network interface.
+
+When HTTPS is selected, MLX Manager uses the certificate and key paths shown in the GUI. If the default paths are used and the files do not exist, the manager generates a local self-signed certificate under `certs/`. That is good for local encrypted testing, but clients such as LLM-OS must either disable certificate verification for that local self-signed cert or be configured with a trusted CA bundle.
+
+For production-like use, provide a real certificate/key pair and keep client certificate verification enabled.
+
+---
+
 ## Gateway Auth
 
 The embedded gateway supports bearer-token auth. Auth defaults on for the secure path, and the user can explicitly disable it in the GUI for isolated local experiments.
@@ -157,6 +174,11 @@ If enabled:
 
 - `GET /v1/models` requires `Authorization: Bearer <token>`
 - `POST /v1/chat/completions` requires `Authorization: Bearer <token>`
+- `GET /status` requires `Authorization: Bearer <token>`
+
+`GET /health` and `GET /ready` are intentionally unauthenticated so local
+supervisors, launch agents, and simple clients can distinguish "gateway alive"
+from "model ready" without sending a generation request.
 
 Default testing token in this project has often been:
 
@@ -167,6 +189,42 @@ sk-mytoken
 But the user can set any token in the GUI.
 
 When the token, auth toggle, host mode, or gateway port changes, MLX Manager persists the new gateway settings and re-syncs compatible clients such as LLM-OS. The sync cache includes the model, visible state, base URL, auth flag, and effective token so a token-only change is not skipped as a duplicate model update.
+
+When the protocol changes, MLX Manager also re-syncs the client base URL as either `http://...` or `https://...` and sends the configured client SSL verification preference.
+
+---
+
+## Gateway Contract
+
+The gateway keeps its serving surface intentionally close to the OpenAI API so
+LLM-OS, opencode, IDEs, scripts, and other local tools can all use the same
+configuration style.
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | No | Returns `200` when the gateway process is alive. |
+| `GET /ready` | No | Returns `200` only when a model is ready; otherwise `503` with `Retry-After`. |
+| `GET /status` | Yes, when auth is enabled | Full machine-readable state, model, idle policy, usage, and gateway/internal ports. |
+| `GET /v1/models` | Yes, when auth is enabled | OpenAI-compatible model list plus MLX state metadata. |
+| `POST /v1/chat/completions` | Yes, when auth is enabled | OpenAI-compatible chat completion; supports blocking and streaming requests. |
+
+Retryable warm/sleep errors use an OpenAI-style envelope:
+
+```json
+{
+  "error": {
+    "message": "Model is warming or waking; retry shortly.",
+    "type": "model_warming",
+    "code": "service_unavailable",
+    "state": "warming"
+  },
+  "message": "Model is warming or waking; retry shortly.",
+  "state": "warming"
+}
+```
+
+Clients should treat `model_warming`, `model_sleeping`, HTTP `202`, `503`, and
+`504` as retryable when the request is a real chat request.
 
 ---
 
@@ -422,6 +480,7 @@ Current behavior:
 - Light sleep should wake on the first real chat request.
 - If the internal MLX server briefly reports `Model warming`, the gateway retries the forwarded request before returning an error.
 - Compatible clients should also treat MLX warmup errors as retryable because wake latency is normal after sleep.
+- `GET /ready` should report `503` with `state=sleeping` or `state=warming` until generation is actually available.
 
 ### Idle sleep does not trigger
 

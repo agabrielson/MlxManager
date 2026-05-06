@@ -10,8 +10,10 @@ Switching kills the current server before starting the next.
 
 import json
 import os
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -98,6 +100,9 @@ STARTUP_REQUEST_TIMEOUT_S = 25
 INTERNAL_FORWARD_TIMEOUT_S = 45
 INTERNAL_READY_TIMEOUT_S = 20
 GENERATION_PROBE_TIMEOUT_S = 12
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
+DEFAULT_GATEWAY_SCHEME = "http"
 AVAILABLE_MODEL_LIMIT = 200
 HF_ORG = "mlx-community"
 LLM_OS_API_BASE = os.environ.get("LLM_OS_API_BASE", "http://localhost:8080")
@@ -105,6 +110,9 @@ DEFAULT_GATEWAY_TOKEN = "sk-mytoken"
 DEFAULT_LLM_OS_LOCAL_BASE_URL = os.environ.get("LLM_OS_LOCAL_BASE_URL")
 ICON_PATH = Path(__file__).parent / "assets" / "mlx_gui_icon.png"
 SETTINGS_PATH = REPO_ROOT / ".mlx_manager.json"
+CERTS_DIR = REPO_ROOT / "certs"
+DEFAULT_GATEWAY_CERT_PATH = CERTS_DIR / "mlx-manager-gateway.crt"
+DEFAULT_GATEWAY_KEY_PATH = CERTS_DIR / "mlx-manager-gateway.key"
 
 # ── Model discovery ───────────────────────────────────────────────────────────
 
@@ -191,6 +199,18 @@ def load_settings() -> dict:
             settings["idle_minutes"] = DEFAULT_IDLE_MINUTES
         if "sleep_mode" not in settings:
             settings["sleep_mode"] = DEFAULT_SLEEP_MODE
+        if "request_timeout_seconds" not in settings:
+            settings["request_timeout_seconds"] = DEFAULT_REQUEST_TIMEOUT_SECONDS
+        if "max_tokens_per_request" not in settings:
+            settings["max_tokens_per_request"] = DEFAULT_MAX_TOKENS_PER_REQUEST
+        if "gateway_scheme" not in settings:
+            settings["gateway_scheme"] = DEFAULT_GATEWAY_SCHEME
+        if "gateway_cert_file" not in settings:
+            settings["gateway_cert_file"] = str(DEFAULT_GATEWAY_CERT_PATH)
+        if "gateway_key_file" not in settings:
+            settings["gateway_key_file"] = str(DEFAULT_GATEWAY_KEY_PATH)
+        if "client_verify_ssl" not in settings:
+            settings["client_verify_ssl"] = False
         return settings
     except Exception:
         return {}
@@ -202,6 +222,88 @@ def save_settings(settings: dict):
         os.chmod(SETTINGS_PATH, 0o600)
     except Exception:
         pass
+
+
+def _path_from_setting(value: Optional[Any], default: Path) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    return Path(raw).expanduser()
+
+
+def ensure_gateway_tls_files(cert_file: Any, key_file: Any) -> tuple[Path, Path]:
+    """Ensure a usable local TLS certificate/key pair exists for the gateway.
+
+    The default path is generated as a local self-signed development cert. If a
+    custom cert/key path is supplied, both files must already exist so we do not
+    accidentally overwrite operator-managed material.
+    """
+    cert_path = Path(cert_file).expanduser()
+    key_path = Path(key_file).expanduser()
+    using_default_paths = (
+        cert_path.resolve() == DEFAULT_GATEWAY_CERT_PATH.resolve()
+        and key_path.resolve() == DEFAULT_GATEWAY_KEY_PATH.resolve()
+    )
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path
+    if not using_default_paths:
+        missing = [str(p) for p in (cert_path, key_path) if not p.exists()]
+        raise FileNotFoundError("Missing TLS file(s): " + ", ".join(missing))
+
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False) as cfg:
+        cfg.write(
+            "\n".join([
+                "[req]",
+                "default_bits = 2048",
+                "prompt = no",
+                "distinguished_name = dn",
+                "x509_extensions = v3_req",
+                "",
+                "[dn]",
+                "CN = localhost",
+                "",
+                "[v3_req]",
+                "subjectAltName = @alt_names",
+                "",
+                "[alt_names]",
+                "DNS.1 = localhost",
+                "DNS.2 = host.docker.internal",
+                "IP.1 = 127.0.0.1",
+            ])
+        )
+        cfg_path = cfg.name
+    try:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048",
+                "-sha256", "-days", "3650",
+                "-keyout", str(key_path),
+                "-out", str(cert_path),
+                "-config", cfg_path,
+                "-extensions", "v3_req",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        os.chmod(key_path, 0o600)
+        os.chmod(cert_path, 0o644)
+    finally:
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+    return cert_path, key_path
+
+
+def create_gateway_ssl_context(cert_file: Any, key_file: Any) -> ssl.SSLContext:
+    cert_path, key_path = ensure_gateway_tls_files(cert_file, key_file)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    return context
 
 
 def startup_diagnostics(mlx_binary: Optional[str]) -> List[str]:
@@ -290,6 +392,8 @@ def sync_llm_os_local_model(
     base_url: str,
     require_auth: bool = False,
     auth_token: str = "",
+    verify_ssl: bool = True,
+    ca_bundle: str = "",
     log_fn=None,
 ) -> bool:
     """Update llm-os live config so it points at the MLX gateway."""
@@ -306,6 +410,9 @@ def sync_llm_os_local_model(
     local["enabled"] = True
     local["backend"] = "mlx_lm"
     local["base_url"] = base_url
+    local["scheme"] = urlsplit(base_url).scheme or DEFAULT_GATEWAY_SCHEME
+    local["verify_ssl"] = bool(verify_ssl)
+    local["ca_bundle"] = ca_bundle
     local["model"] = model_id
     local["auth_enabled"] = bool(require_auth and auth_token)
     local["api_key"] = auth_token if (require_auth and auth_token) else ""
@@ -378,6 +485,8 @@ class MLXManagerWindow(QWidget):
         self.gateway_thread = None
         self._gateway_port = None
         self._gateway_bound_host = None
+        self._gateway_bound_scheme = None
+        self._gateway_tls_self_signed = False
         self._status       = "unknown"
         self._running_id   = None
         self._current_model = None
@@ -385,6 +494,7 @@ class MLXManagerWindow(QWidget):
         self._generation_ready = False
         self._deep_sleeping = False
         self._status_changed_at = ""
+        self._started_at = time.time()
         self._last_activity = time.time()
         self._last_real_question_at = 0.0
         self._last_real_question = ""
@@ -587,6 +697,26 @@ class MLXManagerWindow(QWidget):
         self._port_entry.editingFinished.connect(lambda: self._on_gateway_config_changed(restart_gateway=True))
         ctrl_layout.addWidget(self._port_entry)
 
+        protocol_lbl = QLabel("Gateway Protocol")
+        protocol_lbl.setFont(QFont("Helvetica", 10))
+        protocol_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
+        ctrl_layout.addWidget(protocol_lbl)
+
+        self._gateway_scheme_combo = QComboBox()
+        self._gateway_scheme_combo.setEditable(False)
+        self._gateway_scheme_combo.setFont(QFont("Menlo", 10))
+        self._gateway_scheme_combo.setStyleSheet(
+            f"background: {SURF2}; color: {TEXT}; border: none;"
+            f" border-radius: 4px; padding: 4px 8px;"
+        )
+        self._gateway_scheme_combo.addItem("HTTP", "http")
+        self._gateway_scheme_combo.addItem("HTTPS / TLS", "https")
+        scheme = self._settings.get("gateway_scheme", DEFAULT_GATEWAY_SCHEME)
+        idx = self._gateway_scheme_combo.findData(scheme)
+        self._gateway_scheme_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._gateway_scheme_combo.currentIndexChanged.connect(lambda _idx: self._on_gateway_config_changed(restart_gateway=True))
+        ctrl_layout.addWidget(self._gateway_scheme_combo)
+
         self._auth_toggle = QCheckBox("Require gateway token")
         self._auth_toggle.setChecked(bool(self._settings.get("auth_enabled", False)))
         self._auth_toggle.setStyleSheet(f"color: {TEXT};")
@@ -602,6 +732,32 @@ class MLXManagerWindow(QWidget):
         )
         self._auth_token_entry.editingFinished.connect(lambda: self._on_gateway_config_changed())
         ctrl_layout.addWidget(self._auth_token_entry)
+
+        self._client_verify_ssl_toggle = QCheckBox("Clients verify TLS cert")
+        self._client_verify_ssl_toggle.setChecked(bool(self._settings.get("client_verify_ssl", False)))
+        self._client_verify_ssl_toggle.setStyleSheet(f"color: {TEXT};")
+        self._client_verify_ssl_toggle.stateChanged.connect(lambda _state: self._on_gateway_config_changed())
+        ctrl_layout.addWidget(self._client_verify_ssl_toggle)
+
+        self._gateway_cert_entry = QLineEdit(str(self._settings.get("gateway_cert_file", DEFAULT_GATEWAY_CERT_PATH)))
+        self._gateway_cert_entry.setPlaceholderText("TLS certificate path")
+        self._gateway_cert_entry.setFont(QFont("Menlo", 9))
+        self._gateway_cert_entry.setStyleSheet(
+            f"background: {SURF2}; color: {TEXT}; border: none;"
+            f" border-radius: 4px; padding: 4px 8px;"
+        )
+        self._gateway_cert_entry.editingFinished.connect(lambda: self._on_gateway_config_changed(restart_gateway=True))
+        ctrl_layout.addWidget(self._gateway_cert_entry)
+
+        self._gateway_key_entry = QLineEdit(str(self._settings.get("gateway_key_file", DEFAULT_GATEWAY_KEY_PATH)))
+        self._gateway_key_entry.setPlaceholderText("TLS private key path")
+        self._gateway_key_entry.setFont(QFont("Menlo", 9))
+        self._gateway_key_entry.setStyleSheet(
+            f"background: {SURF2}; color: {TEXT}; border: none;"
+            f" border-radius: 4px; padding: 4px 8px;"
+        )
+        self._gateway_key_entry.editingFinished.connect(lambda: self._on_gateway_config_changed(restart_gateway=True))
+        ctrl_layout.addWidget(self._gateway_key_entry)
 
         self._idle_toggle = QCheckBox("Sleep when idle")
         self._idle_toggle.setChecked(bool(self._settings.get("idle_enabled", DEFAULT_IDLE_ENABLED)))
@@ -814,7 +970,7 @@ class MLXManagerWindow(QWidget):
         self._persist_settings()
         self._sleeping = False
         self._append_log(f"\n{'─'*50}")
-        self._append_log(f"▶ Starting: {mid}  (gateway {self._port()} → internal {self._internal_port()})")
+        self._append_log(f"▶ Starting: {mid}  (gateway {self._gateway_scheme()} port {self._port()} → internal {self._internal_port()})")
 
         def _worker():
             self._ensure_gateway_running()
@@ -835,6 +991,7 @@ class MLXManagerWindow(QWidget):
                     self._gateway_client_base_url(),
                     require_auth=self._auth_enabled(),
                     auth_token=self._auth_token(),
+                    verify_ssl=self._client_verify_ssl(),
                     log_fn=self._bridge.log_line.emit,
                 )
             self._bridge.log_line.emit("  Gateway remains ready for wake-on-request.")
@@ -1134,11 +1291,17 @@ class MLXManagerWindow(QWidget):
             "host_mode": self._gateway_host_mode(),
             "host_mode_user_set": True,
             "port": self._port(),
+            "gateway_scheme": self._gateway_scheme(),
+            "gateway_cert_file": str(self._gateway_cert_file()),
+            "gateway_key_file": str(self._gateway_key_file()),
+            "client_verify_ssl": self._client_verify_ssl(),
             "auth_enabled": auth_enabled,
             "auth_token": auth_token,
             "idle_enabled": self._idle_enabled(),
             "idle_minutes": self._idle_minutes(),
             "sleep_mode": self._sleep_mode(),
+            "request_timeout_seconds": self._request_timeout_seconds(),
+            "max_tokens_per_request": self._max_tokens_per_request(),
             "hf_token": self._hf_token_entry.text().strip() if hasattr(self, "_hf_token_entry") else "",
             "selected_model": self._selected_model() or self._current_model or self._settings.get("selected_model", ""),
             "last_running_model": self._running_id or self._settings.get("last_running_model", ""),
@@ -1158,10 +1321,31 @@ class MLXManagerWindow(QWidget):
     def _gateway_bind_host(self) -> str:
         return LOCALHOST_HOST if self._gateway_host_mode() == "localhost" else DEFAULT_HOST
 
+    def _gateway_scheme(self) -> str:
+        value = (self._gateway_scheme_combo.currentData() if hasattr(self, "_gateway_scheme_combo") else None)
+        scheme = str(value or self._settings.get("gateway_scheme", DEFAULT_GATEWAY_SCHEME) or DEFAULT_GATEWAY_SCHEME).lower()
+        return "https" if scheme == "https" else "http"
+
+    def _gateway_https_enabled(self) -> bool:
+        return self._gateway_scheme() == "https"
+
+    def _gateway_cert_file(self) -> Path:
+        value = self._gateway_cert_entry.text().strip() if hasattr(self, "_gateway_cert_entry") else ""
+        return _path_from_setting(value or self._settings.get("gateway_cert_file"), DEFAULT_GATEWAY_CERT_PATH)
+
+    def _gateway_key_file(self) -> Path:
+        value = self._gateway_key_entry.text().strip() if hasattr(self, "_gateway_key_entry") else ""
+        return _path_from_setting(value or self._settings.get("gateway_key_file"), DEFAULT_GATEWAY_KEY_PATH)
+
+    def _client_verify_ssl(self) -> bool:
+        if hasattr(self, "_client_verify_ssl_toggle"):
+            return bool(self._client_verify_ssl_toggle.isChecked())
+        return bool(self._settings.get("client_verify_ssl", False))
+
     def _gateway_client_base_url(self) -> str:
         if DEFAULT_LLM_OS_LOCAL_BASE_URL:
             return DEFAULT_LLM_OS_LOCAL_BASE_URL.rstrip("/")
-        return f"http://host.docker.internal:{self._port()}"
+        return f"{self._gateway_scheme()}://host.docker.internal:{self._port()}"
 
     def _port(self) -> int:
         try:
@@ -1171,6 +1355,20 @@ class MLXManagerWindow(QWidget):
 
     def _internal_port(self) -> int:
         return self._port() + INTERNAL_PORT_OFFSET
+
+    def _request_timeout_seconds(self) -> int:
+        raw = self._settings.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+        try:
+            return max(5, int(float(raw)))
+        except Exception:
+            return DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    def _max_tokens_per_request(self) -> int:
+        raw = self._settings.get("max_tokens_per_request", DEFAULT_MAX_TOKENS_PER_REQUEST)
+        try:
+            return max(1, int(float(raw)))
+        except Exception:
+            return DEFAULT_MAX_TOKENS_PER_REQUEST
 
     def _auth_enabled(self) -> bool:
         return bool(self._auth_toggle.isChecked())
@@ -1273,7 +1471,18 @@ class MLXManagerWindow(QWidget):
             max_tokens = int(max_tokens) if max_tokens is not None else None
         except Exception:
             max_tokens = None
-        return text in {"ping", "health", "health check", "readiness check"} and (max_tokens is None or max_tokens <= 8)
+        probe_texts = {
+            "ping",
+            "health",
+            "health check",
+            "readiness check",
+            "ready",
+            "reply with exactly: ready",
+        }
+        looks_like_ready_probe = text in probe_texts or (
+            text.startswith("reply with exactly") and "ready" in text
+        )
+        return looks_like_ready_probe and (max_tokens is None or max_tokens <= 16)
 
     def _is_real_chat_question(self, payload: dict) -> bool:
         user_texts = self._payload_user_texts(payload)
@@ -1432,6 +1641,61 @@ class MLXManagerWindow(QWidget):
         question_hits = sum(1 for _, kind in self._gateway_request_times if kind == 'question')
         return f"{len(self._gateway_request_times)} requests in last 5m ({model_hits} models, {chat_hits} chat, {question_hits} real questions)"
 
+    def _gateway_error_payload(self, message: str, error_type: str, code: str, state: Optional[str] = None) -> dict:
+        payload = {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            },
+            "message": message,
+        }
+        if state:
+            payload["state"] = state
+            payload["error"]["state"] = state
+        return payload
+
+    def _gateway_status_payload(self) -> dict:
+        models_payload = self._gateway_models_payload()
+        state = models_payload.get("state") or "unknown"
+        models = models_payload.get("data") or []
+        ready_models = [m for m in models if m.get("ready")]
+        model_id = ready_models[0].get("id") if ready_models else (models[0].get("id") if models else "")
+        stats = self._token_stats_snapshot()
+        last_real = float(stats.get("last_real_question_at") or 0.0)
+        return {
+            "service": "mlx-manager",
+            "status": "ready" if state == "running" else "not_ready",
+            "ready": state == "running",
+            "state": state,
+            "model": model_id,
+            "models": models,
+            "gateway": {
+                "host": self._gateway_bound_host or self._gateway_bind_host(),
+                "port": self._gateway_port or self._port(),
+                "scheme": self._gateway_scheme(),
+                "auth_enabled": self._auth_enabled(),
+                "base_url": self._gateway_client_base_url(),
+                "tls": {
+                    "enabled": self._gateway_https_enabled(),
+                    "cert_file": str(self._gateway_cert_file()) if self._gateway_https_enabled() else "",
+                    "self_signed": bool(self._gateway_tls_self_signed),
+                    "client_verify_ssl": self._client_verify_ssl(),
+                },
+            },
+            "internal": {
+                "host": INTERNAL_HOST,
+                "port": self._internal_port(),
+                "process_active": self._server_process_active(),
+                "generation_ready": self._generation_ready,
+            },
+            "idle": models_payload.get("idle") or {},
+            "usage": models_payload.get("usage") or {},
+            "uptime_seconds": max(0.0, time.time() - self._started_at),
+            "last_real_question_ago_seconds": (time.time() - last_real) if last_real else None,
+            "request_timeout_seconds": self._request_timeout_seconds(),
+        }
+
     def _sync_llm_os_if_needed(self, model_id: Optional[str], state: str, log_fn=None, force: bool = False):
         if not model_id:
             return False
@@ -1441,6 +1705,7 @@ class MLXManagerWindow(QWidget):
             self._gateway_client_base_url(),
             bool(self._auth_enabled()),
             self._auth_token() if self._auth_enabled() else "",
+            bool(self._client_verify_ssl()),
         )
         if (
             not force
@@ -1454,6 +1719,7 @@ class MLXManagerWindow(QWidget):
             self._gateway_client_base_url(),
             require_auth=self._auth_enabled(),
             auth_token=self._auth_token(),
+            verify_ssl=self._client_verify_ssl(),
             log_fn=log_fn or self._append_log,
         )
         if ok:
@@ -1548,6 +1814,8 @@ class MLXManagerWindow(QWidget):
                 self.gateway_thread = None
                 self._gateway_port = None
                 self._gateway_bound_host = None
+                self._gateway_bound_scheme = None
+                self._gateway_tls_self_signed = False
 
     def _enter_deep_sleep(self, reason: str = "idle timeout"):
         self._stop_model_server(reason=reason, sleeping=False)
@@ -1560,17 +1828,25 @@ class MLXManagerWindow(QWidget):
     def _ensure_gateway_running(self) -> bool:
         desired_port = self._port()
         bind_host = self._gateway_bind_host()
+        scheme = self._gateway_scheme()
         with self._gateway_lock:
-            if self.gateway_server and self._gateway_port == desired_port and self._gateway_bound_host == bind_host:
+            if (
+                self.gateway_server
+                and self._gateway_port == desired_port
+                and self._gateway_bound_host == bind_host
+                and self._gateway_bound_scheme == scheme
+            ):
                 return True
             if self.gateway_server:
-                self._append_log(f"↺ Restarting gateway on {bind_host}:{desired_port}")
+                self._append_log(f"↺ Restarting gateway on {scheme}://{bind_host}:{desired_port}")
                 self.gateway_server.shutdown()
                 self.gateway_server.server_close()
                 self.gateway_server = None
                 self.gateway_thread = None
                 self._gateway_port = None
                 self._gateway_bound_host = None
+                self._gateway_bound_scheme = None
+                self._gateway_tls_self_signed = False
 
             manager = self
 
@@ -1588,32 +1864,58 @@ class MLXManagerWindow(QWidget):
                     expected = manager._auth_token()
                     return bool(expected) and self.headers.get("Authorization") == f"Bearer {expected}"
 
-                def _send_json(self, status: int, payload: dict):
+                def _send_json(self, status: int, payload: dict, extra_headers: Optional[dict] = None):
                     body = json.dumps(payload).encode()
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
+                    for key, value in (extra_headers or {}).items():
+                        self.send_header(str(key), str(value))
                     self.end_headers()
                     self.wfile.write(body)
 
+                def _send_error(self, status: int, message: str, error_type: str, code: str, state: Optional[str] = None, retry_after: Optional[int] = None):
+                    headers = {}
+                    if retry_after is not None:
+                        headers["Retry-After"] = str(max(1, int(retry_after)))
+                    self._send_json(status, manager._gateway_error_payload(message, error_type, code, state), headers)
+
                 def do_GET(self):
                     path = urlsplit(self.path).path
-                    if path != "/v1/models":
-                        self._send_json(404, {"error": "Not found"})
+                    if path == "/health":
+                        self._send_json(200, {
+                            "status": "ok",
+                            "service": "mlx-manager",
+                            "state": manager._gateway_models_payload().get("state"),
+                            "uptime_seconds": max(0.0, time.time() - manager._started_at),
+                        })
                         return
-                    if not self._authorized():
-                        self._send_json(401, {"error": "Unauthorized"})
+                    if path == "/ready":
+                        status_payload = manager._gateway_status_payload()
+                        status = 200 if status_payload.get("ready") else 503
+                        headers = {} if status == 200 else {"Retry-After": "5"}
+                        self._send_json(status, status_payload, headers)
                         return
-                    manager._record_gateway_request('models')
-                    self._send_json(200, manager._gateway_models_payload())
+                    if path in {"/status", "/v1/models"}:
+                        if not self._authorized():
+                            self._send_error(401, "Unauthorized", "authentication_error", "unauthorized")
+                            return
+                        if path == "/status":
+                            manager._record_gateway_request('status')
+                            self._send_json(200, manager._gateway_status_payload())
+                            return
+                        manager._record_gateway_request('models')
+                        self._send_json(200, manager._gateway_models_payload())
+                        return
+                    self._send_error(404, "Not found", "invalid_request_error", "not_found")
 
                 def do_POST(self):
                     path = urlsplit(self.path).path
                     if path != "/v1/chat/completions":
-                        self._send_json(404, {"error": "Not found"})
+                        self._send_error(404, "Not found", "invalid_request_error", "not_found")
                         return
                     if not self._authorized():
-                        self._send_json(401, {"error": "Unauthorized"})
+                        self._send_error(401, "Unauthorized", "authentication_error", "unauthorized")
                         return
                     length = int(self.headers.get("Content-Length", "0") or 0)
                     body = self.rfile.read(length)
@@ -1626,10 +1928,13 @@ class MLXManagerWindow(QWidget):
                     elif not manager._server_process_active():
                         self._send_json(
                             202,
-                            {
-                                "state": manager._gateway_models_payload().get("state"),
-                                "message": "No real user question detected; model remains asleep/stopped.",
-                            },
+                            manager._gateway_error_payload(
+                                "No real user question detected; model remains asleep/stopped.",
+                                "model_sleeping",
+                                "probe_ignored",
+                                manager._gateway_models_payload().get("state"),
+                            ),
+                            {"Retry-After": "5"},
                         )
                         return
                     if not manager._ensure_server_running(
@@ -1637,7 +1942,17 @@ class MLXManagerWindow(QWidget):
                         fast_request_wake=True,
                         count_as_activity=real_question,
                     ):
-                        self._send_json(503, {"error": "Model warming", "state": manager._gateway_models_payload().get("state")})
+                        self._send_error(
+                            503,
+                            "Model is warming or waking; retry shortly.",
+                            "model_warming",
+                            "service_unavailable",
+                            manager._gateway_models_payload().get("state"),
+                            retry_after=5,
+                        )
+                        return
+                    if request_payload.get("stream") is True:
+                        manager._forward_stream_to_internal(self, path, body, request_payload, real_question)
                         return
                     status, response_body, content_type = manager._forward_to_internal(path, body)
                     if real_question and 200 <= status < 300:
@@ -1650,6 +1965,16 @@ class MLXManagerWindow(QWidget):
 
             try:
                 self.gateway_server = _GatewayServer((bind_host, desired_port), _Handler)
+                if scheme == "https":
+                    cert_path, key_path = ensure_gateway_tls_files(self._gateway_cert_file(), self._gateway_key_file())
+                    context = create_gateway_ssl_context(cert_path, key_path)
+                    self.gateway_server.socket = context.wrap_socket(self.gateway_server.socket, server_side=True)
+                    self._gateway_tls_self_signed = (
+                        cert_path.resolve() == DEFAULT_GATEWAY_CERT_PATH.resolve()
+                        and key_path.resolve() == DEFAULT_GATEWAY_KEY_PATH.resolve()
+                    )
+                else:
+                    self._gateway_tls_self_signed = False
                 self.gateway_thread = threading.Thread(
                     target=lambda: self.gateway_server.serve_forever(poll_interval=GATEWAY_POLL_INTERVAL_S),
                     daemon=True,
@@ -1657,9 +1982,13 @@ class MLXManagerWindow(QWidget):
                 self.gateway_thread.start()
                 self._gateway_port = desired_port
                 self._gateway_bound_host = bind_host
-                self._append_log(f"↔ Gateway ready on {bind_host}:{desired_port} (internal mlx-lm on {INTERNAL_HOST}:{self._internal_port()})")
+                self._gateway_bound_scheme = scheme
+                self._append_log(f"↔ Gateway ready on {scheme}://{bind_host}:{desired_port} (internal mlx-lm on {INTERNAL_HOST}:{self._internal_port()})")
                 if self._gateway_host_mode() == "localhost":
                     self._append_log(f"  NOTE: localhost mode keeps the gateway private; llm-os is synced via {self._gateway_client_base_url()} for container access.")
+                if scheme == "https":
+                    verify = "enabled" if self._client_verify_ssl() else "disabled for self-signed/local testing"
+                    self._append_log(f"  Gateway TLS: enabled (client certificate verification {verify})")
                 if self._auth_enabled():
                     self._append_log("  Gateway auth: enabled")
                 else:
@@ -1723,6 +2052,62 @@ class MLXManagerWindow(QWidget):
             self._startup_thread.start()
             return self._startup_event
 
+    def _forward_stream_to_internal(self, handler, path: str, body: bytes, request_payload: dict, real_question: bool):
+        req = urllib.request.Request(
+            f"http://{INTERNAL_HOST}:{self._internal_port()}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        started_at = time.time()
+        buffered = bytearray()
+        try:
+            with urllib.request.urlopen(req, timeout=self._request_timeout_seconds()) as resp:
+                self._generation_ready = True
+                content_type = resp.headers.get_content_type() or "text/event-stream"
+                handler.send_response(resp.status)
+                handler.send_header("Content-Type", content_type)
+                handler.send_header("Cache-Control", "no-cache")
+                handler.send_header("Connection", "close")
+                handler.end_headers()
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    if len(buffered) < 2_000_000:
+                        buffered.extend(chunk)
+                    handler.wfile.write(chunk)
+                    handler.wfile.flush()
+                if real_question and 200 <= resp.status < 300:
+                    self._record_token_usage(request_payload, bytes(buffered), content_type)
+                elapsed = time.time() - started_at
+                if elapsed >= 2.0:
+                    self._bridge.log_line.emit(f"  Streamed request completed in {elapsed:.1f}s")
+        except urllib.error.HTTPError as exc:
+            raw_body = exc.read()
+            text = raw_body.decode(errors="replace")
+            try:
+                payload = json.loads(text or "{}")
+                if not isinstance(payload, dict):
+                    raise ValueError("non-object error")
+            except Exception:
+                payload = self._gateway_error_payload(
+                    text[:300] or "MLX stream request failed.",
+                    "api_error",
+                    "upstream_error",
+                    self._gateway_models_payload().get("state"),
+                )
+            handler._send_json(exc.code, payload)
+        except Exception as exc:
+            elapsed = time.time() - started_at
+            state = self._gateway_models_payload().get("state")
+            self._bridge.log_line.emit(f"  Stream request failed after {elapsed:.1f}s (state={state}): {exc}")
+            handler._send_json(
+                504,
+                self._gateway_error_payload(str(exc), "timeout_error", "gateway_timeout", state),
+                {"Retry-After": "5"},
+            )
+
     def _forward_to_internal(self, path: str, body: bytes):
         req = urllib.request.Request(
             f"http://{INTERNAL_HOST}:{self._internal_port()}{path}",
@@ -1731,7 +2116,7 @@ class MLXManagerWindow(QWidget):
             method="POST",
         )
         started_at = time.time()
-        timeout_s = INTERNAL_READY_TIMEOUT_S if self._generation_ready else INTERNAL_FORWARD_TIMEOUT_S
+        timeout_s = self._request_timeout_seconds()
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -1755,10 +2140,15 @@ class MLXManagerWindow(QWidget):
                 elapsed = time.time() - started_at
                 state = self._gateway_models_payload().get("state")
                 self._bridge.log_line.emit(f"  Forward request failed after {elapsed:.1f}s (state={state}): {exc}")
-                payload = json.dumps({"error": str(exc), "state": state}).encode()
+                payload = json.dumps(self._gateway_error_payload(str(exc), "timeout_error", "gateway_timeout", state)).encode()
                 return 504, payload, "application/json"
 
-        payload = json.dumps({"error": "Model warming", "state": self._gateway_models_payload().get("state")}).encode()
+        payload = json.dumps(self._gateway_error_payload(
+            "Model is warming or waking; retry shortly.",
+            "model_warming",
+            "service_unavailable",
+            self._gateway_models_payload().get("state"),
+        )).encode()
         return 503, payload, "application/json"
 
     @staticmethod
@@ -1961,8 +2351,12 @@ class MLXManagerWindow(QWidget):
                     self.gateway_thread = None
                     self._gateway_port = None
                     self._gateway_bound_host = None
+                    self._gateway_bound_scheme = None
+                    self._gateway_tls_self_signed = False
                 self._gateway_bound_host = None
+                self._gateway_bound_scheme = None
         self._gateway_bound_host = None
+        self._gateway_bound_scheme = None
         super().closeEvent(event)
 
 
