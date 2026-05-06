@@ -10,6 +10,7 @@ Switching kills the current server before starting the next.
 
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -453,6 +454,7 @@ class _Bridge(QObject):
     idle_timer_stop = pyqtSignal()
     idle_timeout_request = pyqtSignal()
     usage_refresh = pyqtSignal()
+    close_finished = pyqtSignal()
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -476,6 +478,7 @@ class MLXManagerWindow(QWidget):
         self._bridge.idle_timer_stop.connect(self._stop_idle_timer)
         self._bridge.idle_timeout_request.connect(self._on_idle_timeout)
         self._bridge.usage_refresh.connect(self._refresh_usage_status)
+        self._bridge.close_finished.connect(self._finish_close)
 
         self._settings     = load_settings()
         self.mlx_binary    = find_mlx_binary()
@@ -519,6 +522,8 @@ class MLXManagerWindow(QWidget):
         self._startup_model = None
         self._startup_started_at = 0.0
         self._shutdown_requested = False
+        self._close_in_progress = False
+        self._close_finalizing = False
         self._idle_watchdog_thread = None
         self._expected_exit_pid = None
         self._expected_exit_reason = ""
@@ -1803,19 +1808,46 @@ class MLXManagerWindow(QWidget):
         }
 
     def _shutdown_gateway(self):
+        server = None
+        host = None
+        port = None
         with self._gateway_lock:
             if self.gateway_server:
-                try:
-                    self.gateway_server.shutdown()
-                    self.gateway_server.server_close()
-                except Exception:
-                    pass
+                server = self.gateway_server
+                host = self._gateway_bound_host
+                port = self._gateway_port
                 self.gateway_server = None
                 self.gateway_thread = None
                 self._gateway_port = None
                 self._gateway_bound_host = None
                 self._gateway_bound_scheme = None
                 self._gateway_tls_self_signed = False
+        self._shutdown_gateway_instance(server, host, port)
+
+    def _shutdown_gateway_instance(self, server, host: Optional[str], port: Optional[int]):
+        if not server:
+            return
+        self._wake_gateway_for_shutdown(host, port)
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception as exc:
+            self._bridge.log_line.emit(f"  Gateway shutdown warning: {exc}")
+
+    def _wake_gateway_for_shutdown(self, host: Optional[str], port: Optional[int]):
+        if not host or not port:
+            return
+
+        def _poke():
+            time.sleep(0.05)
+            connect_host = LOCALHOST_HOST if host in {"0.0.0.0", "::", ""} else host
+            try:
+                with socket.create_connection((connect_host, int(port)), timeout=0.75):
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_poke, daemon=True, name="gateway-shutdown-wake").start()
 
     def _enter_deep_sleep(self, reason: str = "idle timeout"):
         self._stop_model_server(reason=reason, sleeping=False)
@@ -1839,20 +1871,23 @@ class MLXManagerWindow(QWidget):
                 return True
             if self.gateway_server:
                 self._append_log(f"↺ Restarting gateway on {scheme}://{bind_host}:{desired_port}")
-                self.gateway_server.shutdown()
-                self.gateway_server.server_close()
+                old_server = self.gateway_server
+                old_host = self._gateway_bound_host
+                old_port = self._gateway_port
                 self.gateway_server = None
                 self.gateway_thread = None
                 self._gateway_port = None
                 self._gateway_bound_host = None
                 self._gateway_bound_scheme = None
                 self._gateway_tls_self_signed = False
+                self._shutdown_gateway_instance(old_server, old_host, old_port)
 
             manager = self
 
             class _GatewayServer(ThreadingHTTPServer):
                 allow_reuse_address = True
                 daemon_threads = True
+                block_on_close = False
 
             class _Handler(BaseHTTPRequestHandler):
                 def log_message(self, fmt, *args):
@@ -2002,6 +2037,9 @@ class MLXManagerWindow(QWidget):
 
     def _start_server_worker(self, mid: str, reason: str):
         try:
+            if self._shutdown_requested:
+                self._startup_error = "startup cancelled by shutdown"
+                return
             preferred = self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
             running = check_server(self._internal_port(), host=INTERNAL_HOST, preferred_model=preferred)
             if not running:
@@ -2012,6 +2050,9 @@ class MLXManagerWindow(QWidget):
 
             deadline = time.time() + STARTUP_TIMEOUT_S
             while time.time() < deadline:
+                if self._shutdown_requested:
+                    self._startup_error = "startup cancelled by shutdown"
+                    return
                 if self.server_proc and self.server_proc.poll() is not None:
                     self._startup_error = f"server exited before ready (code {self.server_proc.returncode})"
                     break
@@ -2165,6 +2206,8 @@ class MLXManagerWindow(QWidget):
 
     def _ensure_server_running(self, reason: str = "manual start", fast_request_wake: bool = False, count_as_activity: bool = True) -> bool:
         with self._server_lock:
+            if self._shutdown_requested:
+                return False
             preferred = self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
             running = check_server(self._internal_port(), host=INTERNAL_HOST, preferred_model=preferred)
             if running and self._generation_ready:
@@ -2201,6 +2244,9 @@ class MLXManagerWindow(QWidget):
         wait_timeout = STARTUP_REQUEST_TIMEOUT_S if fast_request_wake else STARTUP_TIMEOUT_S
         finished = event.wait(wait_timeout)
 
+        if self._shutdown_requested:
+            return False
+
         preferred = self._current_model or self._selected_model() or self._settings.get("last_running_model", "")
         running = check_server(self._internal_port(), host=INTERNAL_HOST, preferred_model=preferred)
         if running and (self._generation_ready or fast_request_wake):
@@ -2223,6 +2269,9 @@ class MLXManagerWindow(QWidget):
         return False
 
     def _launch_server_process(self, mid: str):
+        if self._shutdown_requested:
+            self._bridge.log_line.emit("  Startup skipped because shutdown is in progress.")
+            return
         kill_all_servers(lambda m: self._bridge.log_line.emit(m))
         if self.server_proc and self.server_proc.poll() is None:
             try:
@@ -2266,16 +2315,37 @@ class MLXManagerWindow(QWidget):
 
         threading.Thread(target=_stream_logs, args=(proc,), daemon=True).start()
 
-    def _stop_model_server(self, reason: str = "manual stop", sleeping: bool = False):
-        with self._server_lock:
+    def _stop_model_server(
+        self,
+        reason: str = "manual stop",
+        sleeping: bool = False,
+        wait_timeout: float = 5.0,
+        lock_timeout: Optional[float] = None,
+    ):
+        if lock_timeout is None:
+            acquired = self._server_lock.acquire()
+        else:
+            acquired = self._server_lock.acquire(timeout=max(0.0, float(lock_timeout)))
+        if not acquired:
+            self._bridge.log_line.emit("  Server lock busy during shutdown; sending TERM to mlx_lm servers.")
+            kill_all_servers(lambda m: self._bridge.log_line.emit(m))
+            self.server_proc = None
+            self._running_id = None
+            self._generation_ready = False
+            self._bridge.idle_timer_stop.emit()
+            self._sleeping = False
+            self._bridge.status_set.emit("stopped", "")
+            return
+        try:
             if self.server_proc and self.server_proc.poll() is None:
                 try:
                     self._mark_expected_process_exit(self.server_proc, reason)
                     self.server_proc.terminate()
-                    self.server_proc.wait(timeout=5)
+                    self.server_proc.wait(timeout=max(0.1, float(wait_timeout)))
                 except Exception:
                     try:
                         self.server_proc.kill()
+                        self.server_proc.wait(timeout=2)
                     except Exception:
                         pass
             self.server_proc = None
@@ -2291,6 +2361,8 @@ class MLXManagerWindow(QWidget):
                 self._bridge.log_line.emit(f"  Gateway activity while paused: {self._gateway_request_summary()}")
             else:
                 self._bridge.status_set.emit("stopped", "")
+        finally:
+            self._server_lock.release()
 
     def _apply_status(self, state: str, label: str = ""):
         self._status = state
@@ -2332,32 +2404,44 @@ class MLXManagerWindow(QWidget):
         self._log_box.append(f"[{ts}] {msg}")
         self._log_box.moveCursor(QTextCursor.MoveOperation.End)
 
+    def _begin_close(self):
+        self._close_in_progress = True
+        self._shutdown_requested = True
+        self.setEnabled(False)
+        self._apply_status("stopping", "Closing…")
+        self._append_log("■ Closing MLX Manager; stopping gateway and model in the background…")
+
+        def _worker():
+            try:
+                self._persist_settings()
+                self._shutdown_gateway()
+                self._stop_model_server(
+                    reason="window close",
+                    sleeping=False,
+                    wait_timeout=3.0,
+                    lock_timeout=2.0,
+                )
+            finally:
+                self._bridge.close_finished.emit()
+
+        threading.Thread(target=_worker, daemon=True, name="mlx-manager-close").start()
+
+    def _finish_close(self):
+        self._close_finalizing = True
+        self.close()
+
     def _refresh_setup_status(self):
         if not hasattr(self, "_setup_status_box"):
             return
         self._setup_status_box.setPlainText("\n".join(startup_diagnostics(self.mlx_binary)))
 
     def closeEvent(self, event):
-        self._shutdown_requested = True
-        self._persist_settings()
-        try:
-            self._stop_model_server(reason="window close", sleeping=False)
-        finally:
-            with self._gateway_lock:
-                if self.gateway_server:
-                    self.gateway_server.shutdown()
-                    self.gateway_server.server_close()
-                    self.gateway_server = None
-                    self.gateway_thread = None
-                    self._gateway_port = None
-                    self._gateway_bound_host = None
-                    self._gateway_bound_scheme = None
-                    self._gateway_tls_self_signed = False
-                self._gateway_bound_host = None
-                self._gateway_bound_scheme = None
-        self._gateway_bound_host = None
-        self._gateway_bound_scheme = None
-        super().closeEvent(event)
+        if self._close_finalizing:
+            super().closeEvent(event)
+            return
+        if not self._close_in_progress:
+            self._begin_close()
+        event.ignore()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

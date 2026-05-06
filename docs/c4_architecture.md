@@ -479,3 +479,5 @@ Use this checklist when changing the manager:
 - In light sleep, send a real chat request and confirm wake-on-request.
 - In deep sleep, confirm the gateway stops and manual wake is required.
 - Confirm `Stop All` terminates the MLX subprocess and updates status.
+- Close the window while the gateway is idle; confirm the GUI does not freeze and no listener remains on the gateway port.
+- Close the window while a model is starting or waking; confirm shutdown is bounded and any `mlx_lm server` process is terminated.
