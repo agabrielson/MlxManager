@@ -1106,6 +1106,8 @@ class MLXManagerWindow(QWidget):
         def _watchdog():
             while not self._shutdown_requested:
                 time.sleep(IDLE_WATCHDOG_INTERVAL_S)
+                if self._shutdown_requested:
+                    break
                 try:
                     enabled, idle_seconds, _sleep_mode = self._idle_config_snapshot()
                     if not enabled or self._sleeping or self._deep_sleeping:
@@ -1116,7 +1118,12 @@ class MLXManagerWindow(QWidget):
                     if reference and (time.time() - reference) >= idle_seconds:
                         self._bridge.idle_timeout_request.emit()
                 except Exception as exc:
-                    self._bridge.log_line.emit(f"  Idle watchdog warning: {exc}")
+                    if self._shutdown_requested:
+                        break
+                    try:
+                        self._bridge.log_line.emit(f"  Idle watchdog warning: {exc}")
+                    except RuntimeError:
+                        break
 
         self._idle_watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
         self._idle_watchdog_thread.start()
