@@ -539,6 +539,25 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
         ["Model inventory", "Cached model count, disk use, selected model exists, HF browse/download success.", "Prevents selected-model startup surprises."],
         ["Security hygiene", "No secrets in logs/git, masked diagnostics, auth-on when all-hosts, cert/key presence.", "Important when the gateway is reachable beyond localhost."],
     ]
+    cs_best_practices = [
+        ["Separate mechanism from policy", "Keep generic gateway/process/settings helpers reusable; keep MLX-specific policy in small call sites.", "Makes the manager easier to adapt for opencode or other local clients."],
+        ["Keep UI thread thin", "Never perform network calls, model startup, shutdown waits, downloads, or gateway blocking work on the Qt UI thread.", "Protects responsiveness during warmup, sleep, TLS failures, and model download."],
+        ["Use explicit state transitions", "Represent running, warming, sleeping, deep sleep, stopped, and error as deliberate states with logs and API status.", "Prevents clients from guessing whether to retry, wake, or fail."],
+        ["Make side effects bounded", "Every subprocess, thread, socket, and timer should have a clear owner and bounded shutdown path.", "Avoids orphaned `mlx_lm` servers, stuck ports, and battery drain."],
+        ["Treat configuration as data", "Persist settings through one adapter, mask secrets in diagnostics, and report token fields only as present/missing.", "Prevents the class of config drift that made the HF token appear forgotten."],
+        ["Test contracts, not only functions", "For gateway work, verify HTTP status, JSON envelope, auth behavior, retry semantics, and state fields.", "Clients depend on the contract more than the internal implementation."],
+        ["Prefer small deterministic checks in hooks", "Pre-commit should compile, regenerate/check health, and avoid live model dependencies.", "Keeps commits fast while still catching broken startup syntax and stale reports."],
+        ["Use hotspots to guide refactors", "Refactor files/functions that are complex, changing, and operationally critical before cosmetic cleanup.", "Targets the next bug cluster instead of chasing raw LOC."],
+    ]
+    cs_thresholds = [
+        ["Cyclomatic complexity", "`> 10` review; `> 20` refactor candidate", "Split branch-heavy request handling, gateway state, and settings normalization."],
+        ["Cognitive complexity", "`> 15` review; `> 25` refactor candidate", "Flatten nested state logic and move decision tables into helpers."],
+        ["Function length", "`> 75` review; `> 150` refactor candidate", "Extract one responsibility: parsing, status building, forwarding, or UI rendering."],
+        ["File length", "`> 750` review", "Consider splitting by lifecycle, gateway, settings, telemetry, or UI widgets."],
+        ["Thread/process ownership", "One owner per worker/process/socket", "Name threads, use bridge signals for GUI updates, and keep shutdown bounded."],
+        ["Runtime contract coverage", "Every endpoint and mode has a smoke check", "Cover HTTP/HTTPS, auth on/off, sleeping/warming/running, streaming/non-streaming."],
+        ["Secret exposure", "Zero raw tokens in docs, logs, or commits", "Only report present/missing and run staged diff secret scans before push."],
+    ]
 
     loc_rows = [[k, f"{v:,}"] for k, v in snapshot["loc"]["by_category"].items()]
     hotspot_rows = [
@@ -597,6 +616,14 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
             ),
             "",
             "Complexity should be read as a refactoring signal, not a grade. For this project, high-complexity code is most risky when it also controls gateway routing, subprocess lifecycle, sleep/wake, auth/TLS, or persistent settings.",
+            "",
+            "### CS Best Practices For This Code Region",
+            "",
+            _table(["Practice", "Guidance", "Why It Matters Here"], cs_best_practices),
+            "",
+            "### Suggested Engineering Thresholds",
+            "",
+            _table(["Metric", "Threshold", "Preferred Response"], cs_thresholds),
             "",
             "### Top Hotspots",
             "",

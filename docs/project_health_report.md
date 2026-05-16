@@ -1,6 +1,6 @@
 # MLX Manager Project Health Report
 
-Last generated: 2026-05-16T00:12:12.076503+00:00
+Last generated: 2026-05-16T00:19:12.902973+00:00
 
 This is the living health report for MLX Manager. It tracks whether the project is safe to change, pleasant to operate, and reliable as a local OpenAI-compatible gateway for MLX models.
 
@@ -41,10 +41,10 @@ The report deliberately combines classic computer-science/code metrics with oper
 | Assets | 0 |
 | Documentation | 1,178 |
 | Git hooks | 4 |
-| Health automation | 703 |
+| Health automation | 730 |
 | Python product code | 2,615 |
 | Repo metadata/config | 7 |
-| Total reported LOC | 4,507 |
+| Total reported LOC | 4,534 |
 
 ### Complexity Snapshot
 
@@ -59,12 +59,37 @@ The report deliberately combines classic computer-science/code metrics with oper
 
 Complexity should be read as a refactoring signal, not a grade. For this project, high-complexity code is most risky when it also controls gateway routing, subprocess lifecycle, sleep/wake, auth/TLS, or persistent settings.
 
+### CS Best Practices For This Code Region
+
+| Practice | Guidance | Why It Matters Here |
+| --- | --- | --- |
+| Separate mechanism from policy | Keep generic gateway/process/settings helpers reusable; keep MLX-specific policy in small call sites. | Makes the manager easier to adapt for opencode or other local clients. |
+| Keep UI thread thin | Never perform network calls, model startup, shutdown waits, downloads, or gateway blocking work on the Qt UI thread. | Protects responsiveness during warmup, sleep, TLS failures, and model download. |
+| Use explicit state transitions | Represent running, warming, sleeping, deep sleep, stopped, and error as deliberate states with logs and API status. | Prevents clients from guessing whether to retry, wake, or fail. |
+| Make side effects bounded | Every subprocess, thread, socket, and timer should have a clear owner and bounded shutdown path. | Avoids orphaned `mlx_lm` servers, stuck ports, and battery drain. |
+| Treat configuration as data | Persist settings through one adapter, mask secrets in diagnostics, and report token fields only as present/missing. | Prevents the class of config drift that made the HF token appear forgotten. |
+| Test contracts, not only functions | For gateway work, verify HTTP status, JSON envelope, auth behavior, retry semantics, and state fields. | Clients depend on the contract more than the internal implementation. |
+| Prefer small deterministic checks in hooks | Pre-commit should compile, regenerate/check health, and avoid live model dependencies. | Keeps commits fast while still catching broken startup syntax and stale reports. |
+| Use hotspots to guide refactors | Refactor files/functions that are complex, changing, and operationally critical before cosmetic cleanup. | Targets the next bug cluster instead of chasing raw LOC. |
+
+### Suggested Engineering Thresholds
+
+| Metric | Threshold | Preferred Response |
+| --- | --- | --- |
+| Cyclomatic complexity | `> 10` review; `> 20` refactor candidate | Split branch-heavy request handling, gateway state, and settings normalization. |
+| Cognitive complexity | `> 15` review; `> 25` refactor candidate | Flatten nested state logic and move decision tables into helpers. |
+| Function length | `> 75` review; `> 150` refactor candidate | Extract one responsibility: parsing, status building, forwarding, or UI rendering. |
+| File length | `> 750` review | Consider splitting by lifecycle, gateway, settings, telemetry, or UI widgets. |
+| Thread/process ownership | One owner per worker/process/socket | Name threads, use bridge signals for GUI updates, and keep shutdown bounded. |
+| Runtime contract coverage | Every endpoint and mode has a smoke check | Cover HTTP/HTTPS, auth on/off, sleeping/warming/running, streaming/non-streaming. |
+| Secret exposure | Zero raw tokens in docs, logs, or commits | Only report present/missing and run staged diff secret scans before push. |
+
 ### Top Hotspots
 
 | Rank | File | LOC | Max Cyclomatic | Max Cognitive | Max Function Length | Structural Heuristic |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | mlx_manager.py | 2513 | 36 | 41 | 358 | 0 |
-| 2 | scripts/project_health_snapshot.py | 685 | 22 | 23 | 170 | 0 |
+| 2 | scripts/project_health_snapshot.py | 712 | 22 | 23 | 197 | 0 |
 | 3 | mlx_manager_bootstrap.py | 102 | 7 | 6 | 35 | 0 |
 | 4 | README.md | 563 | 0 | 0 | 0 | 50 |
 | 5 | docs/project_health_report.md | 132 | 0 | 0 | 0 | 82 |
@@ -78,7 +103,7 @@ Complexity should be read as a refactoring signal, not a grade. For this project
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | mlx_manager.py | _ensure_gateway_running | 1900 | 36 | 41 | 177 |
 | 2 | mlx_manager.py | _ensure_server_running | 2247 | 24 | 27 | 63 |
-| 3 | scripts/project_health_snapshot.py | render_markdown | 490 | 22 | 23 | 170 |
+| 3 | scripts/project_health_snapshot.py | render_markdown | 490 | 22 | 23 | 197 |
 | 4 | mlx_manager.py | _gateway_models_payload | 1804 | 20 | 25 | 45 |
 | 5 | mlx_manager.py | _set_cached_models | 1256 | 18 | 21 | 62 |
 | 6 | mlx_manager.py | load_settings | 219 | 18 | 17 | 34 |
