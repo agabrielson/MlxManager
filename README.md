@@ -49,6 +49,10 @@ Core files in this folder:
   Stdlib-only first-run helper that creates `mlx-env`, installs dependencies, and relaunches the GUI.
 - [docs/c4_architecture.md](./docs/c4_architecture.md)
   Full C4 architecture, state machine, and algorithm descriptions for startup, gateway forwarding, sleep/wake, token accounting, and client sync.
+- [docs/project_health_report.md](./docs/project_health_report.md)
+  Living project-health report covering code metrics plus MLX-specific operator health such as gateway readiness, sleep/wake, auth/TLS, token persistence, and process hygiene.
+- [scripts/project_health_snapshot.py](./scripts/project_health_snapshot.py)
+  Stdlib-only snapshot generator for the health report and pre-commit checks.
 - [assets/mlx_gui_icon.png](./assets/mlx_gui_icon.png)
   GUI icon asset.
 - [/.mlx_manager.json](./.mlx_manager.json)
@@ -135,6 +139,39 @@ Typical persisted values include:
 - Hugging Face token
 
 The GUI is the preferred way to edit these.
+
+The health report intentionally checks this file without printing secrets. Token
+fields are reported as present/missing only.
+
+---
+
+## Project Health
+
+MLX Manager has a project-health report similar in spirit to LLM-OS, but tuned
+for this code region:
+
+- static code health: LOC, complexity, hotspots, compile status
+- runtime/operator health: gateway status, readiness, process count, cached model inventory
+- configuration health: token presence, auth/TLS mode, host binding, sleep policy, file permissions
+- pre-commit health: fast deterministic checks that do not require the model or gateway to be running
+
+Generate or refresh the report with:
+
+```bash
+scripts/project_health_snapshot.py --write
+```
+
+Run the fast pre-commit checks directly with:
+
+```bash
+scripts/pre_commit_check.sh
+```
+
+Install the optional repo-local hook with:
+
+```bash
+scripts/install_git_hooks.sh
+```
 
 ---
 

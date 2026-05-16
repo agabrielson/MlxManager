@@ -54,9 +54,10 @@ if os.environ.get("MLX_MANAGER_SKIP_REEXEC") != "1" and REPO_PYTHON.exists():
         pass
 
 try:
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi, HfFolder, snapshot_download
 except Exception:
     HfApi = None
+    HfFolder = None
     snapshot_download = None
 
 try:
@@ -114,6 +115,38 @@ SETTINGS_PATH = REPO_ROOT / ".mlx_manager.json"
 CERTS_DIR = REPO_ROOT / "certs"
 DEFAULT_GATEWAY_CERT_PATH = CERTS_DIR / "mlx-manager-gateway.crt"
 DEFAULT_GATEWAY_KEY_PATH = CERTS_DIR / "mlx-manager-gateway.key"
+
+
+def default_hf_token() -> str:
+    env_token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        or ""
+    ).strip()
+    if env_token:
+        return env_token
+    if HfFolder is not None:
+        try:
+            return str(HfFolder.get_token() or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def effective_hf_token(settings: Optional[dict] = None, entered_token: Optional[str] = None) -> str:
+    """Resolve the usable HF token without letting routine saves erase it."""
+
+    candidates = [
+        entered_token,
+        (settings or {}).get("hf_token"),
+        default_hf_token(),
+    ]
+    for candidate in candidates:
+        token = str(candidate or "").strip()
+        if token:
+            return token
+    return ""
 
 # ── Model discovery ───────────────────────────────────────────────────────────
 
@@ -212,6 +245,8 @@ def load_settings() -> dict:
             settings["gateway_key_file"] = str(DEFAULT_GATEWAY_KEY_PATH)
         if "client_verify_ssl" not in settings:
             settings["client_verify_ssl"] = False
+        if not str(settings.get("hf_token") or "").strip():
+            settings["hf_token"] = default_hf_token()
         return settings
     except Exception:
         return {}
@@ -849,7 +884,7 @@ class MLXManagerWindow(QWidget):
         hub_lbl.setStyleSheet(f"color: {MUTED}; background: transparent;")
         ctrl_layout.addWidget(hub_lbl)
 
-        self._hf_token_entry = QLineEdit(self._settings.get("hf_token", self._default_hf_token()))
+        self._hf_token_entry = QLineEdit(effective_hf_token(self._settings))
         self._hf_token_entry.setPlaceholderText("HF token (optional, uses env if blank)")
         self._hf_token_entry.setEchoMode(QLineEdit.EchoMode.Password)
         self._hf_token_entry.setFont(QFont("Menlo", 11))
@@ -1284,16 +1319,11 @@ class MLXManagerWindow(QWidget):
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _default_hf_token(self) -> str:
-        return (
-            os.environ.get("HF_TOKEN")
-            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-            or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-            or ""
-        )
+        return default_hf_token()
 
     def _hf_token(self) -> str:
         token = self._hf_token_entry.text().strip() if hasattr(self, "_hf_token_entry") else ""
-        return token or self._default_hf_token()
+        return effective_hf_token(self._settings, token)
 
     def _persist_settings(self):
         auth_enabled = self._auth_enabled()
@@ -1314,7 +1344,10 @@ class MLXManagerWindow(QWidget):
             "sleep_mode": self._sleep_mode(),
             "request_timeout_seconds": self._request_timeout_seconds(),
             "max_tokens_per_request": self._max_tokens_per_request(),
-            "hf_token": self._hf_token_entry.text().strip() if hasattr(self, "_hf_token_entry") else "",
+            "hf_token": effective_hf_token(
+                self._settings,
+                self._hf_token_entry.text().strip() if hasattr(self, "_hf_token_entry") else "",
+            ),
             "selected_model": self._selected_model() or self._current_model or self._settings.get("selected_model", ""),
             "last_running_model": self._running_id or self._settings.get("last_running_model", ""),
         }
