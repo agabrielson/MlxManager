@@ -1,6 +1,6 @@
 # MLX Manager Project Health Report
 
-Last generated: 2026-05-16T00:19:12.902973+00:00
+Last generated: 2026-05-16T00:31:20.771883+00:00
 
 This is the living health report for MLX Manager. It tracks whether the project is safe to change, pleasant to operate, and reliable as a local OpenAI-compatible gateway for MLX models.
 
@@ -10,7 +10,7 @@ The report deliberately combines classic computer-science/code metrics with oper
 
 | Area | Status | Evidence |
 | --- | --- | --- |
-| Compile check | Green | /Users/agabriel/Documents/cs/mlx-llm/mlx-env/bin/python |
+| Compile check | Green | mlx-env/bin/python |
 | Gateway status | Green | http://127.0.0.1:9000; health=200, ready=503, state=sleeping |
 | Settings persistence | Green | mode=0o600; hf_token=present |
 | Process hygiene | Green | manager=1; mlx_server=0 |
@@ -39,19 +39,19 @@ The report deliberately combines classic computer-science/code metrics with oper
 | Area | Lines |
 | --- | --- |
 | Assets | 0 |
-| Documentation | 1,178 |
+| Documentation | 1,203 |
 | Git hooks | 4 |
-| Health automation | 730 |
+| Health automation | 743 |
 | Python product code | 2,615 |
 | Repo metadata/config | 7 |
-| Total reported LOC | 4,534 |
+| Total reported LOC | 4,572 |
 
 ### Complexity Snapshot
 
 | Metric | Current Value |
 | --- | --- |
 | Python files analyzed | 3 |
-| Python functions analyzed | 165 |
+| Python functions analyzed | 166 |
 | Functions with cyclomatic complexity `> 10` | 19 |
 | Functions with cognitive complexity `> 15` | 14 |
 | Functions longer than 75 lines | 5 |
@@ -89,10 +89,10 @@ Complexity should be read as a refactoring signal, not a grade. For this project
 | Rank | File | LOC | Max Cyclomatic | Max Cognitive | Max Function Length | Structural Heuristic |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | mlx_manager.py | 2513 | 36 | 41 | 358 | 0 |
-| 2 | scripts/project_health_snapshot.py | 712 | 22 | 23 | 197 | 0 |
+| 2 | scripts/project_health_snapshot.py | 725 | 22 | 23 | 197 | 0 |
 | 3 | mlx_manager_bootstrap.py | 102 | 7 | 6 | 35 | 0 |
-| 4 | README.md | 563 | 0 | 0 | 0 | 50 |
-| 5 | docs/project_health_report.md | 132 | 0 | 0 | 0 | 82 |
+| 4 | docs/project_health_report.md | 157 | 0 | 0 | 0 | 103 |
+| 5 | README.md | 563 | 0 | 0 | 0 | 50 |
 | 6 | docs/c4_architecture.md | 483 | 0 | 0 | 0 | 29 |
 | 7 | scripts/install_git_hooks.sh | 9 | 0 | 0 | 0 | 0 |
 | 8 | scripts/pre_commit_check.sh | 9 | 0 | 0 | 0 | 0 |
@@ -103,7 +103,7 @@ Complexity should be read as a refactoring signal, not a grade. For this project
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | mlx_manager.py | _ensure_gateway_running | 1900 | 36 | 41 | 177 |
 | 2 | mlx_manager.py | _ensure_server_running | 2247 | 24 | 27 | 63 |
-| 3 | scripts/project_health_snapshot.py | render_markdown | 490 | 22 | 23 | 197 |
+| 3 | scripts/project_health_snapshot.py | render_markdown | 503 | 22 | 23 | 197 |
 | 4 | mlx_manager.py | _gateway_models_payload | 1804 | 20 | 25 | 45 |
 | 5 | mlx_manager.py | _set_cached_models | 1256 | 18 | 21 | 62 |
 | 6 | mlx_manager.py | load_settings | 219 | 18 | 17 | 34 |
@@ -114,7 +114,7 @@ Complexity should be read as a refactoring signal, not a grade. For this project
 
 | Metric | Current Value |
 | --- | --- |
-| Settings file | /Users/agabriel/Documents/cs/mlx-llm/.mlx_manager.json |
+| Settings file | .mlx_manager.json |
 | Settings permissions | 0o600 (ok) |
 | HF token | present |
 | Gateway auth | enabled |

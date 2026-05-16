@@ -480,6 +480,19 @@ def _fmt_bytes(num: int) -> str:
     return f"{num} B"
 
 
+def _display_path(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    try:
+        path = Path(text)
+        if path.is_absolute():
+            return path.relative_to(REPO_ROOT).as_posix()
+    except Exception:
+        pass
+    return text
+
+
 def _table(headers: list[str], rows: list[list[Any]]) -> str:
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for row in rows:
@@ -507,7 +520,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
         gateway_status = "Green" if health.get("status") == 200 and ready.get("status") in {200, 503} else "Review"
 
     rows = [
-        ["Compile check", "Green" if compile_check["ok"] else "Review", compile_check["interpreter"]],
+        ["Compile check", "Green" if compile_check["ok"] else "Review", _display_path(compile_check["interpreter"])],
         ["Gateway status", gateway_status, f"{gateway.get('base_url', gateway.get('reason', ''))}; {gateway_state}"],
         [
             "Settings persistence",
@@ -638,7 +651,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
             _table(
                 ["Metric", "Current Value"],
                 [
-                    ["Settings file", settings["path"]],
+                    ["Settings file", _display_path(settings["path"])],
                     ["Settings permissions", f"{settings.get('mode')} ({'ok' if settings.get('healthy_permissions') else 'review'})"],
                     ["HF token", "present" if settings.get("hf_token_present") else "missing"],
                     ["Gateway auth", "enabled" if settings.get("auth_enabled") else "disabled"],
